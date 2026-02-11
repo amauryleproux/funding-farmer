@@ -296,6 +296,32 @@ class HLClient:
         except:
             return []
     
+    @staticmethod
+    def _round_price(price: float, is_buy: bool) -> float:
+        """Arrondit le prix au format Hyperliquid (5 significant figures).
+        
+        Hyperliquid exige des prix à 5 chiffres significatifs max.
+        Ex: 1.4695 → 1.4700 (arrondi up si buy, down si sell)
+        Ex: 45123 → 45120
+        Ex: 0.001234 → 0.0012340
+        """
+        import math
+        if price <= 0:
+            return price
+        
+        # Nombre de décimales pour 5 significant figures
+        magnitude = math.floor(math.log10(abs(price)))
+        decimals = max(0, 4 - magnitude)  # 5 sig figs - 1
+        
+        if is_buy:
+            # Arrondir UP pour être sûr d'être exécuté en achat
+            factor = 10 ** decimals
+            return math.ceil(price * factor) / factor
+        else:
+            # Arrondir DOWN pour être sûr d'être exécuté en vente
+            factor = 10 ** decimals
+            return math.floor(price * factor) / factor
+    
     def place_order(self, coin: str, is_buy: bool, size: float, 
                     price: Optional[float] = None, reduce_only: bool = False) -> dict:
         """Place un ordre limit (ALO/post-only) ou market."""
@@ -313,6 +339,7 @@ class HLClient:
             
             if price:
                 # Limit order, post-only (ALO) pour payer maker fee
+                price = self._round_price(price, is_buy)
                 order_result = self._exchange.order(
                     coin, is_buy, size, price,
                     {"limit": {"tif": "Alo"}},
@@ -320,11 +347,12 @@ class HLClient:
                 )
             else:
                 # Market order (IOC aggressif)
-                # On utilise un prix très favorable pour simuler un market order
                 mid = self.get_mid_price(coin)
-                slippage = 0.002  # 0.2% slippage
+                slippage = 0.005  # 0.5% slippage pour être sûr d'être exécuté
                 aggressive_price = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
-                aggressive_price = round(aggressive_price, 6)
+                aggressive_price = self._round_price(aggressive_price, is_buy)
+                
+                log.info(f"  Prix mid: ${mid:.6f} → ordre @ ${aggressive_price:.6f}")
                 
                 order_result = self._exchange.order(
                     coin, is_buy, size, aggressive_price,
@@ -519,14 +547,47 @@ class FundingFarmer:
         # Placer l'ordre (market pour s'assurer d'être exécuté)
         result = self.client.place_order(coin, is_buy, size, price=None)
         
-        # Enregistrer la position
+        # Vérifier que l'ordre a été exécuté
+        order_ok = False
+        actual_price = mark_price
+        
+        if result.get("dry_run"):
+            order_ok = True
+        elif result.get("status") == "ok":
+            response = result.get("response", {})
+            data = response.get("data", {})
+            statuses = data.get("statuses", [])
+            
+            if statuses:
+                first_status = statuses[0]
+                if "filled" in first_status:
+                    order_ok = True
+                    actual_price = float(first_status["filled"]["avgPx"])
+                    log.info(f"  ✅ Ordre rempli @ ${actual_price:.4f}")
+                elif "resting" in first_status:
+                    order_ok = True
+                    log.info(f"  ⏳ Ordre posté (resting)")
+                elif "error" in first_status:
+                    log.error(f"  ❌ Ordre rejeté: {first_status['error']}")
+                else:
+                    log.warning(f"  ⚠️ Statut inattendu: {first_status}")
+            else:
+                log.error(f"  ❌ Pas de statut dans la réponse: {result}")
+        else:
+            log.error(f"  ❌ Ordre échoué: {result}")
+        
+        if not order_ok:
+            log.error(f"  ❌ Position NON ouverte sur {coin}, ordre non exécuté")
+            return
+        
+        # Enregistrer la position (seulement si l'ordre est OK)
         entry_fee = position_usd * self.config.taker_fee_bps / 10000  # Market order = taker
         
         position = Position(
             coin=coin,
             direction=direction,
             size=size if is_buy else -size,  # Négatif pour short
-            entry_price=mark_price,
+            entry_price=actual_price,
             entry_time=datetime.now(timezone.utc),
             funding_at_entry=opp["funding_rate"],
             fees_paid=entry_fee,

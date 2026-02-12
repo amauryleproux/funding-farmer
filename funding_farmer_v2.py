@@ -609,7 +609,8 @@ class HLClient:
     
     def _get_recent_move(self, coin: str, hours: int = 4) -> float:
         """Retourne le % de mouvement de prix sur les N dernières heures.
-        Positif = prix a monté, Négatif = prix a baissé."""
+        Positif = prix a monté, Négatif = prix a baissé.
+        Prend le MAX entre le move moyen sur N heures ET la plus grosse bougie 1h récente."""
         try:
             start = int((time.time() - hours * 3600) * 1000)
             end = int(time.time() * 1000)
@@ -623,12 +624,34 @@ class HLClient:
             if not candles:
                 return 0.0
             
+            # Move total sur la période
             open_price = float(candles[0]["o"])
             close_price = float(candles[-1]["c"])
-            
+            total_move = 0.0
             if open_price > 0:
-                return (close_price - open_price) / open_price * 100
-            return 0.0
+                total_move = (close_price - open_price) / open_price * 100
+            
+            # Plus grosse bougie individuelle (absolue)
+            max_candle_move = 0.0
+            for c in candles:
+                c_open = float(c["o"])
+                c_close = float(c["c"])
+                c_high = float(c["h"])
+                c_low = float(c["l"])
+                if c_open > 0:
+                    # Body move
+                    body = (c_close - c_open) / c_open * 100
+                    # Full range (wick to wick)
+                    full_range = (c_high - c_low) / c_open * 100
+                    
+                    candle_move = max(abs(body), full_range)
+                    if candle_move > max_candle_move:
+                        max_candle_move = candle_move
+            
+            # Retourner le plus grand des deux (signe = direction du move total)
+            sign = 1 if total_move >= 0 else -1
+            return sign * max(abs(total_move), max_candle_move)
+            
         except:
             return 0.0
     

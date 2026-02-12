@@ -568,16 +568,69 @@ class HLClient:
         else:
             scores["consistency"] = 5
         
-        # ─── TOTAL ───
-        total = sum(scores.values())
+        # ─── TOTAL (avant pénalité) ───
+        raw_total = sum(scores.values())
+        
+        # ─── 6. PÉNALITÉ: SQUEEZE DÉJÀ EU LIEU (-0 à -60) ───
+        # Si le prix a déjà bougé massivement dans notre direction,
+        # le squeeze est DERRIÈRE nous, pas devant.
+        recent_move = self._get_recent_move(coin, hours=4)
+        
+        # Pour un short squeeze (funding négatif), le move dangereux est UP
+        # Pour un long squeeze (funding positif), le move dangereux est DOWN
+        if funding_rate < 0:
+            already_squeezed_pct = max(0, recent_move)   # Move UP = squeeze déjà fait
+        else:
+            already_squeezed_pct = max(0, -recent_move)  # Move DOWN = squeeze déjà fait
+        
+        penalty = 0
+        if already_squeezed_pct >= 15:
+            penalty = -60  # Move massif = squeeze terminé, ne pas entrer
+        elif already_squeezed_pct >= 10:
+            penalty = -45
+        elif already_squeezed_pct >= 5:
+            penalty = -25
+        elif already_squeezed_pct >= 3:
+            penalty = -10
+        
+        scores["post_squeeze_penalty"] = penalty
+        total = max(0, raw_total + penalty)
         
         return {
             "total": total,
+            "raw_total": raw_total,
             "components": scores,
             "funding_accel": funding_accel,
             "premium_pct": premium_pct,
             "oi_vol_ratio": oi_vol_ratio,
+            "recent_move_pct": recent_move,
+            "already_squeezed_pct": already_squeezed_pct,
         }
+    
+    def _get_recent_move(self, coin: str, hours: int = 4) -> float:
+        """Retourne le % de mouvement de prix sur les N dernières heures.
+        Positif = prix a monté, Négatif = prix a baissé."""
+        try:
+            start = int((time.time() - hours * 3600) * 1000)
+            end = int(time.time() * 1000)
+            resp = requests.post(API_URL, json={
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": "1h", "startTime": start, "endTime": end}
+            }, timeout=10)
+            resp.raise_for_status()
+            candles = resp.json()
+            
+            if not candles:
+                return 0.0
+            
+            open_price = float(candles[0]["o"])
+            close_price = float(candles[-1]["c"])
+            
+            if open_price > 0:
+                return (close_price - open_price) / open_price * 100
+            return 0.0
+        except:
+            return 0.0
     
     def get_account_state(self) -> dict:
         """Retourne l'état complet du compte."""
@@ -854,9 +907,12 @@ class FundingFarmerV2:
             opportunities.append(opp)
             
             # Log squeeze details pour les top tokens
-            log.info(f"  📊 {coin}: fund={abs_funding_pct:.3f}%/h vol={vol_24h:.1f}% "
-                     f"SQ={squeeze_score}/100 prem={sq['premium_pct']:+.2f}% "
-                     f"accel={sq['funding_accel']:+.0f}% → score={score:.1f}")
+            penalty_tag = f" ⚠️MOVED {sq['already_squeezed_pct']:+.1f}%" if sq.get("already_squeezed_pct", 0) > 3 else ""
+            log.info(f"  📊 {coin}: fund={abs_funding_pct:.3f}%/h "
+                     f"SQ={squeeze_score}/100 (raw:{sq['raw_total']}) "
+                     f"prem={sq['premium_pct']:+.2f}% "
+                     f"move4h={sq['recent_move_pct']:+.1f}%{penalty_tag} "
+                     f"→ score={score:.1f}")
         
         # Trier par score décroissant
         opportunities.sort(key=lambda x: x.score, reverse=True)
@@ -1335,9 +1391,9 @@ class FundingFarmerV2:
             for opp in opportunities[:5]:
                 mode_tag = "🛡️DN" if opp.has_spot else "⚡DIR"
                 sq_bar = "🔥" if opp.squeeze_score >= 70 else ("⭐" if opp.squeeze_score >= 50 else "  ")
+                move_warn = f"⚠️{opp.oi_trend:+.0f}%" if hasattr(opp, '_recent_move') else ""
                 print(f"│  {sq_bar} {opp.coin:<8} {opp.funding_pct:>+.4f}%/h "
                       f"SQ:{opp.squeeze_score:>3.0f}/100 "
-                      f"vol:{opp.volatility_24h:>4.1f}% "
                       f"prem:{opp.premium_pct:>+.2f}% "
                       f"{mode_tag}")
         

@@ -196,6 +196,8 @@ class Position:
     peak_pnl_pct: float = 0.0       # Plus haut P&L atteint en %
     squeeze_active: bool = False     # Trailing stop activé?
     trailing_stop_price: float = 0.0 # Prix du trailing stop
+    # On-exchange SL
+    sl_oid: int = 0                  # Order ID du stop-loss on-exchange
 
 
 @dataclass
@@ -752,6 +754,84 @@ class HLClient:
         spot_coin = spot_info["spot_coin"]
         return self._place_order(spot_coin, is_buy, size, is_spot=True)
     
+    def place_stop_loss(self, coin: str, is_buy: bool, size: float, 
+                        trigger_price: float) -> dict:
+        """Place un stop-loss trigger order sur l'exchange.
+        
+        is_buy: True si on veut acheter (pour fermer un short), False pour vendre (fermer un long)
+        trigger_price: prix qui déclenche le SL (mark price)
+        """
+        if self.config.dry_run or not self._exchange:
+            log.info(f"🧪 [DRY] SL {'BUY' if is_buy else 'SELL'} {size} {coin} trigger@${trigger_price:.6f}")
+            return {"status": "ok", "dry_run": True}
+        
+        try:
+            sz_decimals = self._perp_sz_decimals.get(coin, 2)
+            size = round(size, sz_decimals)
+            
+            trigger_price = self._round_price(trigger_price, not is_buy)  # Round conservativement
+            
+            # SL market order: quand mark price atteint triggerPx, un market order est envoyé
+            # Le limit price doit être très agressif pour s'exécuter (10% slippage comme HL docs)
+            slippage = 0.10  # 10% slippage max pour SL
+            limit_price = trigger_price * (1 + slippage) if is_buy else trigger_price * (1 - slippage)
+            limit_price = self._round_price(limit_price, is_buy)
+            
+            trigger_px_str = str(trigger_price)
+            
+            order_type = {
+                "trigger": {
+                    "triggerPx": trigger_px_str,
+                    "isMarket": True,
+                    "tpsl": "sl"
+                }
+            }
+            
+            log.info(f"  🛑 Placement SL on-exchange: {'BUY' if is_buy else 'SELL'} {size} {coin} "
+                     f"trigger@${trigger_price:.6f} limit@${limit_price:.6f}")
+            
+            result = self._exchange.order(
+                coin, is_buy, size, limit_price,
+                order_type,
+                reduce_only=True,
+            )
+            
+            log.info(f"  🛑 SL résultat: {result}")
+            return result
+            
+        except Exception as e:
+            log.error(f"❌ Erreur SL: {e}")
+            return {"status": "error", "msg": str(e)}
+    
+    def cancel_trigger_order(self, coin: str, oid: int) -> bool:
+        """Annule un trigger order (SL/TP) par son OID."""
+        if self.config.dry_run or not self._exchange:
+            return True
+        try:
+            result = self._exchange.cancel(coin, oid)
+            log.info(f"  ❌ Trigger order annulé: {coin} oid={oid} → {result}")
+            return True
+        except Exception as e:
+            log.error(f"  Erreur cancel trigger: {e}")
+            return False
+    
+    def get_open_trigger_orders(self, coin: str = None) -> list[dict]:
+        """Récupère les trigger orders ouverts."""
+        if not self.config.account_address:
+            return []
+        try:
+            resp = requests.post(API_URL, json={
+                "type": "openOrders",
+                "user": self.config.account_address
+            }, timeout=10)
+            resp.raise_for_status()
+            orders = resp.json()
+            if coin:
+                orders = [o for o in orders if o.get("coin") == coin]
+            return orders
+        except:
+            return []
+    
     @staticmethod
     def parse_order_result(result: dict) -> tuple[bool, float, float]:
         """Parse le résultat d'un ordre. Returns (success, avg_price, filled_size)."""
@@ -1081,11 +1161,33 @@ class FundingFarmerV2:
             total_fees=fee,
         )
         
+        # ─── PLACEMENT SL ON-EXCHANGE IMMÉDIAT ───
+        entry_price = price or mark_price
+        if is_buy:  # Long → SL = vendre si prix baisse
+            sl_trigger = entry_price * (1 - self.config.stop_loss_pct / 100)
+            sl_is_buy = False
+        else:  # Short → SL = acheter si prix monte
+            sl_trigger = entry_price * (1 + self.config.stop_loss_pct / 100)
+            sl_is_buy = True
+        
+        sl_result = self.client.place_stop_loss(coin, sl_is_buy, abs(filled), sl_trigger)
+        
+        # Extraire l'OID du SL pour pouvoir l'annuler plus tard
+        try:
+            sl_statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
+            if sl_statuses and "resting" in sl_statuses[0]:
+                self.position.sl_oid = sl_statuses[0]["resting"]["oid"]
+                log.info(f"  🛑 SL on-exchange actif @ ${sl_trigger:.6f} (oid={self.position.sl_oid})")
+            elif sl_statuses:
+                log.info(f"  🛑 SL placé (statut: {sl_statuses[0]})")
+        except Exception as e:
+            log.warning(f"  ⚠️ SL placé mais OID non parsé: {e}")
+        
         self.stats.total_trades += 1
         self.stats.directional_trades += 1
         self.stats.total_fees += fee
         
-        log.info(f"  ✅ Rempli @ ${price:.4f}")
+        log.info(f"  ✅ Rempli @ ${price:.4f} + SL @ ${sl_trigger:.6f}")
         
         self._log_trade("ENTER_DIR", coin, {
             "mode": "DIRECTIONAL", "direction": opp.direction,
@@ -1106,6 +1208,23 @@ class FundingFarmerV2:
         
         log.info(f"\n{'='*60}")
         log.info(f"🚪 EXIT: {pos.coin} | Mode: {pos.mode} | Raison: {reason}")
+        
+        # ─── ANNULER LE SL ON-EXCHANGE D'ABORD ───
+        # Sinon on risque un double-close (notre market close + le SL qui trigger)
+        if pos.sl_oid:
+            log.info(f"  🛑 Annulation SL on-exchange oid={pos.sl_oid}")
+            self.client.cancel_trigger_order(pos.coin, pos.sl_oid)
+            pos.sl_oid = 0
+        
+        # Si la raison est STOP_LOSS et qu'il a été triggeré on-exchange,
+        # la position est peut-être déjà fermée
+        if "STOP_LOSS" in reason and not reason.startswith("TRAILING"):
+            real_positions = self.client.get_real_positions()
+            still_open = any(p["coin"] == pos.coin for p in real_positions)
+            if not still_open:
+                log.info(f"  ℹ️ Position déjà fermée par SL on-exchange")
+                self._finalize_close(pos, reason, pos.perp_entry_price, 0)
+                return
         
         current_price = self.client.get_mid_price(pos.coin)
         
@@ -1174,6 +1293,57 @@ class FundingFarmerV2:
         
         self.position = None
     
+    def _finalize_close(self, pos: Position, reason: str, exit_price: float, exit_fee: float):
+        """Finalise une fermeture quand la position a été fermée par SL on-exchange."""
+        hold_hours = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() / 3600
+        estimated_funding = abs(pos.funding_at_entry) * abs(pos.perp_size) * pos.perp_entry_price * hold_hours
+        
+        if pos.perp_size > 0:
+            perp_pnl = (exit_price - pos.perp_entry_price) * abs(pos.perp_size)
+        else:
+            perp_pnl = (pos.perp_entry_price - exit_price) * abs(pos.perp_size)
+        
+        pos.total_fees += exit_fee
+        net = perp_pnl + estimated_funding - pos.total_fees
+        
+        log.info(f"   Durée: {hold_hours:.1f}h | P&L: ${perp_pnl:+.4f} | Fund: +${estimated_funding:.4f}")
+        log.info(f"   ═══ NET: ${net:+.4f} ═══")
+        log.info(f"{'='*60}")
+        
+        self.stats.total_price_pnl += perp_pnl
+        self.stats.total_funding += estimated_funding
+        self.stats.total_fees += exit_fee
+        
+        self._log_trade("EXIT", pos.coin, {
+            "mode": pos.mode, "reason": reason,
+            "perp_pnl": perp_pnl, "funding": estimated_funding,
+            "fees": pos.total_fees, "net": net, "hold_hours": hold_hours,
+        })
+        self.position = None
+    
+    def _update_sl_on_exchange(self, new_trigger: float):
+        """Met à jour le SL on-exchange (cancel + replace)."""
+        pos = self.position
+        if not pos or self.config.dry_run:
+            return
+        
+        # Cancel l'ancien
+        if pos.sl_oid:
+            self.client.cancel_trigger_order(pos.coin, pos.sl_oid)
+            pos.sl_oid = 0
+        
+        # Placer le nouveau
+        is_buy = pos.perp_size < 0  # Buy to close short
+        sl_result = self.client.place_stop_loss(pos.coin, is_buy, abs(pos.perp_size), new_trigger)
+        
+        try:
+            sl_statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
+            if sl_statuses and "resting" in sl_statuses[0]:
+                pos.sl_oid = sl_statuses[0]["resting"]["oid"]
+                log.info(f"  🛑 SL mis à jour → ${new_trigger:.6f} (oid={pos.sl_oid})")
+        except:
+            pass
+    
     # ====================================================================
     # CHECK EXITS & ROTATION
     # ====================================================================
@@ -1229,6 +1399,14 @@ class FundingFarmerV2:
             log.info(f"  Trailing stop activé @ ${pos.trailing_stop_price:.4f} "
                      f"({self.config.trailing_stop_pct}% sous le peak)")
             log.info(f"  Mode rapide: check toutes les {self.config.squeeze_check_interval}s")
+            
+            # Monter le SL on-exchange à breakeven (entrée + fees)
+            fee_pct = self.config.perp_taker_bps * 2 / 10000  # Entrée + sortie
+            if pos.perp_size > 0:
+                breakeven_price = pos.perp_entry_price * (1 + fee_pct)
+            else:
+                breakeven_price = pos.perp_entry_price * (1 - fee_pct)
+            self._update_sl_on_exchange(breakeven_price)
         
         # Check trailing stop
         if pos.squeeze_active:
@@ -1303,6 +1481,14 @@ class FundingFarmerV2:
                 pos.trailing_stop_price = current_price * (1 + self.config.trailing_stop_pct / 100)
             log.info(f"\n  🚀🚀🚀 SQUEEZE DÉTECTÉ sur {pos.coin}! PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
             log.info(f"  Trailing stop @ ${pos.trailing_stop_price:.4f}")
+            
+            # Monter le SL on-exchange à breakeven
+            fee_pct = self.config.perp_taker_bps * 2 / 10000
+            if pos.perp_size > 0:
+                breakeven_price = pos.perp_entry_price * (1 + fee_pct)
+            else:
+                breakeven_price = pos.perp_entry_price * (1 - fee_pct)
+            self._update_sl_on_exchange(breakeven_price)
         
         # 1. Trailing stop (si squeeze actif)
         if pos.squeeze_active:
@@ -1505,7 +1691,17 @@ class FundingFarmerV2:
                     opportunities = self.scan_opportunities()
                     last_full_scan = now
                 
-                # 2. Check exits (prix + funding + squeeze detection)
+                # 2. Check si position fermée par SL on-exchange
+                if self.position and cycle % 5 == 0:
+                    real_positions = self.client.get_real_positions()
+                    pos_exists = any(p["coin"] == self.position.coin for p in real_positions)
+                    if not pos_exists:
+                        log.info(f"\n  🛑 Position {self.position.coin} fermée par SL on-exchange!")
+                        current_price = self.client.get_mid_price(self.position.coin)
+                        self._finalize_close(self.position, "SL_ON_EXCHANGE", current_price, 
+                                           abs(self.position.perp_size) * current_price * self.config.perp_taker_bps / 10000)
+                
+                # 3. Check exits (prix + funding + squeeze detection)
                 current_rates = self.client.get_all_funding_rates()
                 if self.position:
                     exit_reason = self.check_exit_conditions(current_rates)

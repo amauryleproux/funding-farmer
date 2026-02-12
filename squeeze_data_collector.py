@@ -69,7 +69,7 @@ class CollectorConfig:
     hl_candle_limit: int = 5000  # Max par requête
     hl_min_volume_24h: float = 100_000  # $100K min volume
     hl_max_volume_24h: float = 50_000_000  # $50M max (éviter BTC/ETH)
-    hl_request_delay: float = 0.3  # Délai entre requêtes (rate limit)
+    hl_request_delay: float = 1.0  # Délai entre requêtes (rate limit safe)
 
     # --- Solana / GeckoTerminal ---
     gt_base_url: str = "https://api.geckoterminal.com/api/v2"

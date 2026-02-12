@@ -99,7 +99,7 @@ class TraderConfig:
 
     # --- Scan Frequency ---
     scan_interval_sec: float = 300.0      # Scanner les squeezes toutes les 5 min
-    data_update_interval_sec: float = 600.0  # Update données toutes les 10 min
+    data_update_interval_sec: float = 900.0  # Update données toutes les 15 min
 
     # --- Hyperliquid ---
     hl_min_volume: float = 100_000        # Volume min 24h
@@ -532,7 +532,7 @@ class SqueezeAutoTrader:
     # =========================================================================
 
     def _update_data(self):
-        """Met à jour les données OHLCV."""
+        """Met à jour les données OHLCV (incrémental, rate-limit safe)."""
         log.info("📊 Mise à jour des données...")
 
         try:
@@ -544,17 +544,37 @@ class SqueezeAutoTrader:
             for t in tokens:
                 save_token_meta(self.conn, t)
 
-            # Candles (les 100 dernières pour chaque token)
-            updated = 0
-            for token in tokens:
-                coin = token["symbol"]
-                candles = self.hl_fetcher.fetch_candles(coin, "1h")
-                if candles:
-                    save_candles(self.conn, "hyperliquid", coin, coin, "1h", candles)
-                    updated += 1
-                time.sleep(0.2)
+            # Candles : seulement les dernières 12h (pas l'historique complet)
+            now_ms = int(time.time() * 1000)
+            start_ms = now_ms - (12 * 3600 * 1000)  # 12h back
 
-            log.info(f"📊 {updated}/{len(tokens)} tokens mis à jour")
+            updated = 0
+            errors = 0
+            for i, token in enumerate(tokens):
+                coin = token["symbol"]
+                try:
+                    candles = self.hl_fetcher.fetch_candles(
+                        coin, "1h", start_time=start_ms, end_time=now_ms
+                    )
+                    if candles:
+                        save_candles(self.conn, "hyperliquid", coin, coin, "1h", candles)
+                        updated += 1
+                except Exception as e:
+                    errors += 1
+                    if "429" in str(e):
+                        # Rate limited — back off progressively
+                        wait = min(10, 2 + errors * 0.5)
+                        log.warning(f"  Rate limited, waiting {wait:.0f}s...")
+                        time.sleep(wait)
+
+                # 1s entre chaque requête (safe pour HL)
+                time.sleep(1.0)
+
+                # Log progress tous les 50 tokens
+                if (i + 1) % 50 == 0:
+                    log.info(f"  Progress: {i+1}/{len(tokens)} ({updated} OK, {errors} erreurs)")
+
+            log.info(f"📊 {updated}/{len(tokens)} tokens mis à jour ({errors} erreurs)")
 
         except Exception as e:
             log.error(f"Erreur update données: {e}")

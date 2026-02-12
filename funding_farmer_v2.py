@@ -778,7 +778,7 @@ class HLClient:
             
             order_type = {
                 "trigger": {
-                    "triggerPx": str(trigger_price),
+                    "triggerPx": trigger_price,  # Le SDK attend un nombre, pas un string
                     "isMarket": True,
                     "tpsl": "sl"
                 }

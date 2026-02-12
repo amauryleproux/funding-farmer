@@ -32,6 +32,7 @@ import sys
 import json
 import time
 import math
+import statistics
 import requests
 import argparse
 import logging
@@ -96,6 +97,11 @@ class Config:
     # Risk — Directional mode
     stop_loss_pct: float = 5.0        # SL 5% pour directionnel
     
+    # Squeeze / Trailing stop
+    squeeze_threshold_pct: float = 3.0   # Activer trailing stop à +3% de gain
+    trailing_stop_pct: float = 1.2       # Trailing stop: 1.2% sous le peak
+    squeeze_check_interval: float = 2.0  # Check prix toutes les 2s en squeeze mode
+    
     # Risk — Common
     max_hold_hours: float = 72.0      # Max 3 jours
     min_hold_hours: float = 1.0       # Min 1h avant de considérer rotation
@@ -103,6 +109,8 @@ class Config:
     # Filters
     min_volume_24h: float = 100_000   # Perp volume
     min_open_interest: float = 50_000
+    max_volatility_24h: float = 8.0   # Max 8% de vol 24h pour directionnel
+    min_funding_vol_ratio: float = 0.5  # Funding annualisé / vol annualisée minimum
     blocked_coins: list = field(default_factory=lambda: ["PURR", "HFUN"])
     
     # Operational
@@ -154,6 +162,15 @@ class Opportunity:
     hourly_usd_per_1k: float = 0.0
     entry_cost_pct: float = 0.0     # Coût total d'entrée en %
     hours_to_breakeven: float = 999.0
+    # Volatility
+    volatility_24h: float = 0.0     # Vol 24h en %
+    funding_vol_ratio: float = 0.0  # funding annualisé / vol annualisée (plus c'est haut mieux c'est)
+    score: float = 0.0              # Score composite final
+    # Squeeze indicators
+    squeeze_score: float = 0.0      # Score de squeeze 0-100
+    funding_accel: float = 0.0      # Accélération du funding (dernières 6h vs 6h avant)
+    oi_trend: float = 0.0           # Tendance OI (% change sur 24h)  
+    premium_pct: float = 0.0        # Premium mark vs oracle en %
 
 
 @dataclass
@@ -174,6 +191,11 @@ class Position:
     total_funding_collected: float = 0.0
     total_fees: float = 0.0
     status: str = "OPEN"
+    # Squeeze tracking
+    peak_price: float = 0.0          # Plus haut prix atteint
+    peak_pnl_pct: float = 0.0       # Plus haut P&L atteint en %
+    squeeze_active: bool = False     # Trailing stop activé?
+    trailing_stop_price: float = 0.0 # Prix du trailing stop
 
 
 @dataclass
@@ -186,6 +208,7 @@ class Stats:
     total_price_pnl: float = 0.0
     total_fees: float = 0.0
     rotations: int = 0
+    squeezes_captured: int = 0
     
     @property
     def net_pnl(self) -> float:
@@ -359,6 +382,202 @@ class HLClient:
             return float(resp.json().get(coin, 0))
         except:
             return 0.0
+    
+    def get_volatility_24h(self, coin: str) -> float:
+        """Calcule la volatilité 24h en % à partir des candles 1h."""
+        try:
+            start = int((time.time() - 24 * 3600) * 1000)
+            end = int(time.time() * 1000)
+            resp = requests.post(API_URL, json={
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": "1h", "startTime": start, "endTime": end}
+            }, timeout=10)
+            resp.raise_for_status()
+            candles = resp.json()
+            
+            if len(candles) < 4:
+                return 99.0  # Pas assez de data → considérer comme très volatil
+            
+            # Calcul des rendements horaires
+            returns = []
+            for i in range(1, len(candles)):
+                close_prev = float(candles[i - 1]["c"])
+                close_curr = float(candles[i]["c"])
+                if close_prev > 0:
+                    returns.append((close_curr - close_prev) / close_prev)
+            
+            if not returns:
+                return 99.0
+            
+            # Écart-type des rendements × sqrt(24) pour annualiser sur 24h
+            std = statistics.stdev(returns) if len(returns) > 1 else abs(returns[0])
+            vol_24h = std * math.sqrt(24) * 100  # En %
+            
+            # Aussi calculer le range haut-bas sur 24h
+            high = max(float(c["h"]) for c in candles)
+            low = min(float(c["l"]) for c in candles)
+            mid = (high + low) / 2
+            range_pct = (high - low) / mid * 100 if mid > 0 else 99.0
+            
+            # Prendre le max des deux mesures (plus conservateur)
+            return max(vol_24h, range_pct)
+            
+        except Exception as e:
+            log.debug(f"  Vol {coin}: erreur {e}")
+            return 99.0  # En cas d'erreur, considérer très volatil
+    
+    def get_funding_history(self, coin: str, hours: int = 24) -> list[dict]:
+        """Récupère l'historique des funding rates."""
+        try:
+            start_time = int((time.time() - hours * 3600) * 1000)
+            resp = requests.post(API_URL, json={
+                "type": "fundingHistory",
+                "coin": coin,
+                "startTime": start_time
+            }, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except:
+            return []
+    
+    def compute_squeeze_score(self, coin: str, funding_rate: float, 
+                               mark_price: float, oracle_price: float,
+                               open_interest: float, volume_24h: float) -> dict:
+        """
+        Calcule un score de squeeze (0-100) basé sur 5 indicateurs.
+        
+        Chaque indicateur est noté de 0 à 20.
+        Plus le score est élevé, plus le squeeze est probable.
+        
+        Ne fonctionne que pour les fundings négatifs (short squeeze potentiel)
+        ou positifs (long squeeze potentiel).
+        """
+        scores = {}
+        
+        # ─── 1. MAGNITUDE DU FUNDING (0-20) ───
+        # Plus le funding est extrême, plus les shorts/longs souffrent
+        abs_funding = abs(funding_rate) * 100  # en %
+        if abs_funding >= 0.15:
+            scores["funding_magnitude"] = 20
+        elif abs_funding >= 0.10:
+            scores["funding_magnitude"] = 16
+        elif abs_funding >= 0.05:
+            scores["funding_magnitude"] = 12
+        elif abs_funding >= 0.03:
+            scores["funding_magnitude"] = 8
+        else:
+            scores["funding_magnitude"] = 4
+        
+        # ─── 2. ACCÉLÉRATION DU FUNDING (0-20) ───
+        # Funding qui empire = shorts qui s'entassent = bombe qui se charge
+        history = self.get_funding_history(coin, hours=12)
+        funding_accel = 0.0
+        
+        if len(history) >= 6:
+            # Comparer la moyenne des 6 dernières heures vs les 6 précédentes
+            recent = history[-6:]
+            older = history[-12:-6] if len(history) >= 12 else history[:len(history)//2]
+            
+            avg_recent = sum(abs(float(h["fundingRate"])) for h in recent) / len(recent)
+            avg_older = sum(abs(float(h["fundingRate"])) for h in older) / len(older)
+            
+            if avg_older > 0:
+                funding_accel = (avg_recent - avg_older) / avg_older * 100  # % d'accélération
+            
+            # Aussi vérifier la consistance (toutes les heures dans la même direction)
+            same_direction = all(
+                (float(h["fundingRate"]) < 0) == (funding_rate < 0) 
+                for h in recent
+            )
+            
+            if funding_accel > 50 and same_direction:
+                scores["funding_accel"] = 20
+            elif funding_accel > 20 and same_direction:
+                scores["funding_accel"] = 16
+            elif funding_accel > 0 and same_direction:
+                scores["funding_accel"] = 12
+            elif same_direction:
+                scores["funding_accel"] = 8  # Stable mais consistant
+            else:
+                scores["funding_accel"] = 2  # Direction mixte
+        else:
+            scores["funding_accel"] = 5  # Pas assez de data
+        
+        # ─── 3. PREMIUM MARK vs ORACLE (0-20) ───
+        # Mark < Oracle (funding négatif) = shorts poussent le prix sous la réalité
+        # Plus l'écart est grand, plus la correction sera violente
+        premium_pct = 0.0
+        if oracle_price > 0:
+            premium_pct = (mark_price - oracle_price) / oracle_price * 100
+        
+        # Pour un short squeeze, on veut un premium négatif (mark < oracle)
+        if funding_rate < 0:
+            abs_premium = abs(min(0, premium_pct))  # Premium négatif seulement
+        else:
+            abs_premium = abs(max(0, premium_pct))  # Premium positif seulement
+        
+        if abs_premium >= 1.0:
+            scores["premium"] = 20
+        elif abs_premium >= 0.5:
+            scores["premium"] = 16
+        elif abs_premium >= 0.2:
+            scores["premium"] = 12
+        elif abs_premium >= 0.1:
+            scores["premium"] = 8
+        else:
+            scores["premium"] = 3
+        
+        # ─── 4. RATIO OI / VOLUME (0-20) ───
+        # OI élevé vs volume = beaucoup de positions ouvertes mais peu de trading
+        # = positions "coincées" qui devront sortir violemment
+        oi_vol_ratio = open_interest / volume_24h if volume_24h > 0 else 0
+        
+        if oi_vol_ratio >= 0.5:
+            scores["oi_concentration"] = 20
+        elif oi_vol_ratio >= 0.3:
+            scores["oi_concentration"] = 16
+        elif oi_vol_ratio >= 0.15:
+            scores["oi_concentration"] = 12
+        elif oi_vol_ratio >= 0.08:
+            scores["oi_concentration"] = 8
+        else:
+            scores["oi_concentration"] = 3
+        
+        # ─── 5. CONSISTANCE DIRECTIONNELLE (0-20) ───
+        # Si TOUTES les heures récentes sont dans la même direction = pression constante
+        if len(history) >= 12:
+            all_entries = [float(h["fundingRate"]) for h in history[-12:]]
+            same_sign = all(f < 0 for f in all_entries) or all(f > 0 for f in all_entries)
+            
+            if same_sign:
+                avg_rate = sum(abs(f) for f in all_entries) / len(all_entries)
+                if avg_rate * 100 >= 0.10:
+                    scores["consistency"] = 20
+                elif avg_rate * 100 >= 0.05:
+                    scores["consistency"] = 16
+                else:
+                    scores["consistency"] = 12
+            else:
+                flips = sum(1 for i in range(1, len(all_entries)) if all_entries[i] * all_entries[i-1] < 0)
+                if flips <= 1:
+                    scores["consistency"] = 10
+                elif flips <= 3:
+                    scores["consistency"] = 5
+                else:
+                    scores["consistency"] = 1
+        else:
+            scores["consistency"] = 5
+        
+        # ─── TOTAL ───
+        total = sum(scores.values())
+        
+        return {
+            "total": total,
+            "components": scores,
+            "funding_accel": funding_accel,
+            "premium_pct": premium_pct,
+            "oi_vol_ratio": oi_vol_ratio,
+        }
     
     def get_account_state(self) -> dict:
         """Retourne l'état complet du compte."""
@@ -536,10 +755,11 @@ class FundingFarmerV2:
     # ====================================================================
     
     def scan_opportunities(self) -> list[Opportunity]:
-        """Scanne tous les tokens et retourne les meilleures opportunités avec mode."""
+        """Scanne tous les tokens et classe par squeeze score."""
         all_rates = self.client.get_all_funding_rates()
-        opportunities = []
+        candidates = []
         
+        # Phase 1: filtrage rapide par funding + volume
         for coin, data in all_rates.items():
             if coin in self.config.blocked_coins:
                 continue
@@ -554,7 +774,26 @@ class FundingFarmerV2:
             if abs_funding_pct < self.config.min_funding_pct:
                 continue
             
+            candidates.append((coin, data, funding, abs_funding_pct))
+        
+        # Phase 2: top 10 par funding pour analyse approfondie
+        # (squeeze score requiert des appels API supplémentaires)
+        candidates.sort(key=lambda x: x[3], reverse=True)
+        candidates = candidates[:10]
+        
+        opportunities = []
+        for coin, data, funding, abs_funding_pct in candidates:
             direction = "SHORT" if funding > 0 else "LONG"
+            
+            # Calculer volatilité
+            vol_24h = self.client.get_volatility_24h(coin)
+            
+            # Calculer squeeze score
+            sq = self.client.compute_squeeze_score(
+                coin, funding, data["markPx"], data["oraclePx"],
+                data["openInterest"], data["volume24h"]
+            )
+            squeeze_score = sq["total"]
             
             # Check spot
             spot_market = self.client.check_spot_liquidity(coin)
@@ -562,19 +801,37 @@ class FundingFarmerV2:
             
             if has_spot:
                 mode = "DELTA_NEUTRAL"
-                # Fees: spot entry + perp entry + spot exit + perp exit
                 entry_cost = (self.config.spot_taker_bps + self.config.perp_taker_bps) * 2 / 10000 * 100
             else:
                 mode = "DIRECTIONAL"
                 entry_cost = self.config.perp_taker_bps * 2 / 10000 * 100
+                
+                # Filtre volatilité SAUF si squeeze score élevé
+                # Un token avec vol 15% mais squeeze score 80 = on y va
+                if vol_24h > self.config.max_volatility_24h and squeeze_score < 60:
+                    log.debug(f"  {coin}: vol {vol_24h:.1f}% high + squeeze {squeeze_score} low, skip")
+                    continue
             
             hours_to_be = entry_cost / (abs(funding) * 100) if abs(funding) > 0 else 999
+            
+            vol_annualized = vol_24h * math.sqrt(365)
+            funding_annualized = abs_funding_pct * 24 * 365
+            funding_vol_ratio = funding_annualized / vol_annualized if vol_annualized > 0 else 0
+            
+            # Score final = mélange de funding/vol ratio + squeeze potential
+            # Squeeze score (0-100) dominé par le potentiel de squeeze
+            if mode == "DELTA_NEUTRAL":
+                score = abs_funding_pct * 1000  # DN = priorité funding pur
+            else:
+                # Score hybride: 40% funding/vol + 60% squeeze
+                funding_score = min(abs_funding_pct * funding_vol_ratio * 10, 50)
+                score = funding_score * 0.4 + squeeze_score * 0.6
             
             opp = Opportunity(
                 coin=coin,
                 funding_rate=funding,
                 funding_pct=funding * 100,
-                annualized_pct=abs_funding_pct * 24 * 365,
+                annualized_pct=funding_annualized,
                 direction=direction,
                 mark_price=data["markPx"],
                 volume_24h=data["volume24h"],
@@ -586,11 +843,23 @@ class FundingFarmerV2:
                 hourly_usd_per_1k=abs(funding) * 1000,
                 entry_cost_pct=entry_cost,
                 hours_to_breakeven=hours_to_be,
+                volatility_24h=vol_24h,
+                funding_vol_ratio=funding_vol_ratio,
+                score=score,
+                squeeze_score=squeeze_score,
+                funding_accel=sq["funding_accel"],
+                oi_trend=sq["oi_vol_ratio"],
+                premium_pct=sq["premium_pct"],
             )
             opportunities.append(opp)
+            
+            # Log squeeze details pour les top tokens
+            log.info(f"  📊 {coin}: fund={abs_funding_pct:.3f}%/h vol={vol_24h:.1f}% "
+                     f"SQ={squeeze_score}/100 prem={sq['premium_pct']:+.2f}% "
+                     f"accel={sq['funding_accel']:+.0f}% → score={score:.1f}")
         
-        # Trier par funding absolu décroissant
-        opportunities.sort(key=lambda x: abs(x.funding_rate), reverse=True)
+        # Trier par score décroissant
+        opportunities.sort(key=lambda x: x.score, reverse=True)
         return opportunities
     
     # ====================================================================
@@ -709,6 +978,7 @@ class FundingFarmerV2:
         log.info(f"\n{'='*60}")
         log.info(f"⚡ DIRECTIONAL ENTRY: {opp.direction} {size} {coin}")
         log.info(f"   Funding: {opp.funding_pct:+.4f}%/h | SL: {self.config.stop_loss_pct}%")
+        log.info(f"   Squeeze Score: {opp.squeeze_score:.0f}/100 | Premium: {opp.premium_pct:+.2f}%")
         log.info(f"   Position: ~${capital:.2f}")
         log.info(f"{'='*60}")
         
@@ -742,6 +1012,7 @@ class FundingFarmerV2:
             "mode": "DIRECTIONAL", "direction": opp.direction,
             "size": filled, "price": price or mark_price,
             "funding_rate": opp.funding_rate, "fee": fee,
+            "squeeze_score": opp.squeeze_score, "premium_pct": opp.premium_pct,
         })
     
     # ====================================================================
@@ -828,8 +1099,86 @@ class FundingFarmerV2:
     # CHECK EXITS & ROTATION
     # ====================================================================
     
+    def check_price_fast(self) -> Optional[str]:
+        """Check rapide du prix uniquement (pas de funding/rotation).
+        Utilisé en mode squeeze pour réagir vite."""
+        pos = self.position
+        if not pos or pos.mode == "DELTA_NEUTRAL":
+            return None
+        
+        current_price = self.client.get_mid_price(pos.coin)
+        if current_price == 0:
+            return None
+        
+        # P&L
+        if pos.perp_size > 0:
+            pnl_pct = (current_price - pos.perp_entry_price) / pos.perp_entry_price * 100
+        else:
+            pnl_pct = (pos.perp_entry_price - current_price) / pos.perp_entry_price * 100
+        
+        position_usd = abs(pos.perp_size) * pos.perp_entry_price
+        pnl_usd = pnl_pct / 100 * position_usd
+        
+        # Mettre à jour le peak
+        if pnl_pct > pos.peak_pnl_pct:
+            pos.peak_pnl_pct = pnl_pct
+            pos.peak_price = current_price
+            
+            if pos.squeeze_active:
+                # Recalculer le trailing stop
+                if pos.perp_size > 0:  # Long
+                    pos.trailing_stop_price = pos.peak_price * (1 - self.config.trailing_stop_pct / 100)
+                else:  # Short
+                    pos.trailing_stop_price = pos.peak_price * (1 + self.config.trailing_stop_pct / 100)
+                
+                log.info(f"  🔺 Nouveau peak: {pnl_pct:+.2f}% (${pnl_usd:+.2f}) | "
+                         f"TS: ${pos.trailing_stop_price:.4f}")
+        
+        # Détecter l'entrée en squeeze mode
+        if not pos.squeeze_active and pnl_pct >= self.config.squeeze_threshold_pct:
+            pos.squeeze_active = True
+            pos.peak_price = current_price
+            pos.peak_pnl_pct = pnl_pct
+            
+            if pos.perp_size > 0:
+                pos.trailing_stop_price = current_price * (1 - self.config.trailing_stop_pct / 100)
+            else:
+                pos.trailing_stop_price = current_price * (1 + self.config.trailing_stop_pct / 100)
+            
+            log.info(f"\n  🚀🚀🚀 SQUEEZE DÉTECTÉ sur {pos.coin}!")
+            log.info(f"  PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
+            log.info(f"  Trailing stop activé @ ${pos.trailing_stop_price:.4f} "
+                     f"({self.config.trailing_stop_pct}% sous le peak)")
+            log.info(f"  Mode rapide: check toutes les {self.config.squeeze_check_interval}s")
+        
+        # Check trailing stop
+        if pos.squeeze_active:
+            hit = False
+            if pos.perp_size > 0 and current_price <= pos.trailing_stop_price:
+                hit = True
+            elif pos.perp_size < 0 and current_price >= pos.trailing_stop_price:
+                hit = True
+            
+            if hit:
+                self.stats.squeezes_captured += 1
+                return (f"TRAILING_STOP 🎯 (peak: {pos.peak_pnl_pct:+.1f}%, "
+                        f"exit: {pnl_pct:+.1f}%, captured: ${pnl_usd:+.2f})")
+            
+            # Log squeeze status
+            distance_to_ts = abs(current_price - pos.trailing_stop_price) / current_price * 100
+            log.info(f"  🚀 SQUEEZE {pos.coin}: PnL {pnl_pct:+.2f}% (${pnl_usd:+.2f}) | "
+                     f"Peak: {pos.peak_pnl_pct:+.2f}% | TS: ${pos.trailing_stop_price:.4f} "
+                     f"({distance_to_ts:.2f}% away)")
+        
+        # Stop loss classique (toujours actif)
+        hold_hours = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() / 3600
+        if pnl_pct < -self.config.stop_loss_pct and hold_hours > 0.1:
+            return f"STOP_LOSS ({pnl_pct:+.1f}%)"
+        
+        return None
+    
     def check_exit_conditions(self, current_rates: dict) -> Optional[str]:
-        """Vérifie si la position doit être fermée. Retourne la raison ou None."""
+        """Check complet: prix + funding + durée. Appelé toutes les N secondes."""
         pos = self.position
         if not pos:
             return None
@@ -847,44 +1196,79 @@ class FundingFarmerV2:
         else:
             pnl_pct = (pos.perp_entry_price - current_price) / pos.perp_entry_price * 100
         
+        position_usd = abs(pos.perp_size) * pos.perp_entry_price
+        pnl_usd = pnl_pct / 100 * position_usd
+        
         # Funding estimé
         estimated_funding = abs(pos.funding_at_entry) * abs(pos.perp_size) * pos.perp_entry_price * hold_hours
         pos.total_funding_collected = estimated_funding
         
-        # 1. STOP LOSS — uniquement en mode directionnel
+        # Mettre à jour le peak (aussi dans le check complet)
+        if pnl_pct > pos.peak_pnl_pct:
+            pos.peak_pnl_pct = pnl_pct
+            pos.peak_price = current_price
+            if pos.squeeze_active:
+                if pos.perp_size > 0:
+                    pos.trailing_stop_price = pos.peak_price * (1 - self.config.trailing_stop_pct / 100)
+                else:
+                    pos.trailing_stop_price = pos.peak_price * (1 + self.config.trailing_stop_pct / 100)
+        
+        # Détecter squeeze
+        if not pos.squeeze_active and pnl_pct >= self.config.squeeze_threshold_pct:
+            pos.squeeze_active = True
+            pos.peak_price = current_price
+            pos.peak_pnl_pct = pnl_pct
+            if pos.perp_size > 0:
+                pos.trailing_stop_price = current_price * (1 - self.config.trailing_stop_pct / 100)
+            else:
+                pos.trailing_stop_price = current_price * (1 + self.config.trailing_stop_pct / 100)
+            log.info(f"\n  🚀🚀🚀 SQUEEZE DÉTECTÉ sur {pos.coin}! PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
+            log.info(f"  Trailing stop @ ${pos.trailing_stop_price:.4f}")
+        
+        # 1. Trailing stop (si squeeze actif)
+        if pos.squeeze_active:
+            hit = False
+            if pos.perp_size > 0 and current_price <= pos.trailing_stop_price:
+                hit = True
+            elif pos.perp_size < 0 and current_price >= pos.trailing_stop_price:
+                hit = True
+            if hit:
+                self.stats.squeezes_captured += 1
+                return (f"TRAILING_STOP 🎯 (peak: {pos.peak_pnl_pct:+.1f}%, "
+                        f"exit: {pnl_pct:+.1f}%, captured: ${pnl_usd:+.2f})")
+        
+        # 2. STOP LOSS — uniquement en mode directionnel
         if pos.mode == "DIRECTIONAL":
             if pnl_pct < -self.config.stop_loss_pct and hold_hours > 0.1:
                 return f"STOP_LOSS ({pnl_pct:+.1f}%)"
         
-        # 2. Durée max
+        # 3. Durée max
         if hold_hours >= self.config.max_hold_hours:
             return f"MAX_HOLD ({hold_hours:.0f}h)"
         
-        # 3. Funding flip ou disparition
-        coin_data = current_rates.get(pos.coin, {})
-        current_funding = coin_data.get("funding", 0)
-        current_funding_pct = abs(current_funding) * 100
-        
-        if hold_hours >= self.config.min_hold_hours:
-            # Funding trop bas
-            if current_funding_pct < self.config.exit_funding_pct:
-                return f"LOW_FUNDING ({current_funding_pct:.4f}%/h)"
+        # 4. Funding flip ou disparition (pas pendant un squeeze)
+        if not pos.squeeze_active:
+            coin_data = current_rates.get(pos.coin, {})
+            current_funding = coin_data.get("funding", 0)
+            current_funding_pct = abs(current_funding) * 100
             
-            # Funding a changé de signe
-            if pos.direction == "SHORT" and current_funding < 0:
-                return "FUNDING_FLIP"
-            elif pos.direction == "LONG" and current_funding > 0:
-                return "FUNDING_FLIP"
+            if hold_hours >= self.config.min_hold_hours:
+                if current_funding_pct < self.config.exit_funding_pct:
+                    return f"LOW_FUNDING ({current_funding_pct:.4f}%/h)"
+                if pos.direction == "SHORT" and current_funding < 0:
+                    return "FUNDING_FLIP"
+                elif pos.direction == "LONG" and current_funding > 0:
+                    return "FUNDING_FLIP"
         
         # Log status
-        position_usd = abs(pos.perp_size) * pos.perp_entry_price
-        hourly_funding = abs(current_funding) * position_usd
-        net = (pnl_pct / 100 * position_usd) + estimated_funding - pos.total_fees
+        hourly_funding = abs(current_rates.get(pos.coin, {}).get("funding", 0)) * position_usd
+        net = pnl_usd + estimated_funding - pos.total_fees
         
         mode_icon = "🛡️" if pos.mode == "DELTA_NEUTRAL" else "⚡"
+        squeeze_tag = " 🚀SQUEEZE" if pos.squeeze_active else ""
         log.info(
-            f"  {mode_icon} {pos.coin}: {pos.direction} {pos.mode} | "
-            f"{hold_hours:.1f}h | PnL: {pnl_pct:+.2f}% | "
+            f"  {mode_icon} {pos.coin}: {pos.direction} {pos.mode}{squeeze_tag} | "
+            f"{hold_hours:.1f}h | PnL: {pnl_pct:+.2f}% (${pnl_usd:+.2f}) | "
             f"Fund: +${estimated_funding:.4f} (${hourly_funding:.4f}/h) | "
             f"Net: ${net:+.4f}"
         )
@@ -947,12 +1331,15 @@ class FundingFarmerV2:
         
         # Top opportunities
         if opportunities:
-            print(f"│ 🔍 Top funding:")
+            print(f"│ 🔍 Top tokens (trié par squeeze score):")
             for opp in opportunities[:5]:
                 mode_tag = "🛡️DN" if opp.has_spot else "⚡DIR"
-                print(f"│   {opp.coin:<8} {opp.funding_pct:>+.4f}%/h "
-                      f"({opp.annualized_pct:>6.0f}% ann) "
-                      f"{mode_tag} BE:{opp.hours_to_breakeven:.1f}h")
+                sq_bar = "🔥" if opp.squeeze_score >= 70 else ("⭐" if opp.squeeze_score >= 50 else "  ")
+                print(f"│  {sq_bar} {opp.coin:<8} {opp.funding_pct:>+.4f}%/h "
+                      f"SQ:{opp.squeeze_score:>3.0f}/100 "
+                      f"vol:{opp.volatility_24h:>4.1f}% "
+                      f"prem:{opp.premium_pct:>+.2f}% "
+                      f"{mode_tag}")
         
         # Position actuelle
         print(f"│")
@@ -965,9 +1352,12 @@ class FundingFarmerV2:
                   f"(~${pos_usd:.0f}) | {pos.mode}")
             print(f"│   Entrée: ${pos.perp_entry_price:.4f} | Hold: {hold_h:.1f}h | "
                   f"Fund: +${pos.total_funding_collected:.4f}")
-            if pos.mode == "DIRECTIONAL":
+            if pos.squeeze_active:
+                print(f"│   🚀 SQUEEZE ACTIF | Peak: {pos.peak_pnl_pct:+.1f}% | "
+                      f"TS: ${pos.trailing_stop_price:.4f} | Check: {self.config.squeeze_check_interval}s")
+            elif pos.mode == "DIRECTIONAL":
                 print(f"│   SL: {self.config.stop_loss_pct}% | "
-                      f"Pas de SL si delta-neutral")
+                      f"Squeeze trigger: +{self.config.squeeze_threshold_pct}%")
         else:
             print(f"│ 📊 Aucune position")
         
@@ -975,7 +1365,7 @@ class FundingFarmerV2:
         print(f"│")
         print(f"│ 📈 Total: {self.stats.total_trades} trades "
               f"({self.stats.delta_neutral_trades} DN / {self.stats.directional_trades} DIR) "
-              f"| {self.stats.rotations} rotations")
+              f"| {self.stats.rotations} rot | {self.stats.squeezes_captured} 🚀")
         print(f"│   Fund: +${self.stats.total_funding:.4f} | "
               f"Prix: ${self.stats.total_price_pnl:+.4f} | "
               f"Fees: -${self.stats.total_fees:.4f} | "
@@ -991,26 +1381,59 @@ class FundingFarmerV2:
         log.info(f"   Mode: {'DRY RUN' if self.config.dry_run else 'LIVE'}")
         log.info(f"   Capital: ${self.config.capital}")
         log.info(f"   Stratégie: Delta-Neutral si spot dispo, sinon Directionnel (SL {self.config.stop_loss_pct}%)")
+        log.info(f"   Filtre vol: max {self.config.max_volatility_24h}% vol 24h pour directionnel")
+        log.info(f"   Squeeze: trailing stop {self.config.trailing_stop_pct}% activé à +{self.config.squeeze_threshold_pct}%")
+        log.info(f"   Scoring: Squeeze Score 0-100 (funding mag + accel + premium + OI/vol + consistance)")
         log.info(f"   Rotation: switch si avantage > {self.config.rotation_advantage_pct}%/h")
         log.info(f"   Seuil entrée: {self.config.min_funding_pct}%/h | Sortie: {self.config.exit_funding_pct}%/h")
+        log.info(f"   Intervalles: normal={self.config.scan_interval}s | squeeze={self.config.squeeze_check_interval}s")
         print()
         
         cycle = 0
+        last_full_scan = 0
+        
         try:
             while True:
                 cycle += 1
+                now = time.time()
                 
-                # 1. Scanner
-                opportunities = self.scan_opportunities()
+                is_squeeze = self.position and self.position.squeeze_active
                 
-                # 2. Check exits
+                # ─── FAST PATH: squeeze mode → check prix seulement ───
+                if is_squeeze:
+                    exit_reason = self.check_price_fast()
+                    if exit_reason:
+                        self.close_position(exit_reason)
+                        # Après un squeeze exit, re-scanner immédiatement
+                        last_full_scan = 0
+                    
+                    # Full scan moins souvent en squeeze (toutes les 30s)
+                    if now - last_full_scan >= 30:
+                        current_rates = self.client.get_all_funding_rates()
+                        exit_reason = self.check_exit_conditions(current_rates)
+                        if exit_reason:
+                            self.close_position(exit_reason)
+                        last_full_scan = now
+                    
+                    time.sleep(self.config.squeeze_check_interval)
+                    continue
+                
+                # ─── NORMAL PATH: scan complet ───
+                
+                # 1. Scanner (pas à chaque cycle, c'est lourd avec la vol)
+                opportunities = []
+                if now - last_full_scan >= self.config.scan_interval:
+                    opportunities = self.scan_opportunities()
+                    last_full_scan = now
+                
+                # 2. Check exits (prix + funding + squeeze detection)
                 current_rates = self.client.get_all_funding_rates()
                 if self.position:
                     exit_reason = self.check_exit_conditions(current_rates)
                     if exit_reason:
                         self.close_position(exit_reason)
                 
-                # 3. Check rotation (switch vers meilleur token)
+                # 3. Check rotation
                 if self.position and opportunities:
                     better = self.should_rotate(opportunities)
                     if better:
@@ -1022,13 +1445,16 @@ class FundingFarmerV2:
                 # 4. Entrer si pas de position
                 if not self.position and opportunities:
                     best = opportunities[0]
-                    log.info(f"  🎯 Best: {best.coin} {best.funding_pct:+.4f}%/h ({best.mode})")
+                    log.info(f"  🎯 Best: {best.coin} {best.funding_pct:+.4f}%/h "
+                             f"SQ:{best.squeeze_score:.0f}/100 "
+                             f"vol:{best.volatility_24h:.1f}% ({best.mode})")
                     self.enter_position(best)
                 
-                # 5. Display (toutes les 10 cycles)
+                # 5. Display
                 if cycle % 10 == 1:
                     self.display_status(opportunities)
                 
+                # Normal speed quand pas de squeeze
                 time.sleep(self.config.scan_interval)
                 
         except KeyboardInterrupt:
@@ -1054,8 +1480,12 @@ def main():
     parser.add_argument("--capital", type=float, default=77.0)
     parser.add_argument("--threshold", type=float, default=0.03, help="Min funding %%/h")
     parser.add_argument("--stop-loss", type=float, default=5.0, help="SL %% directionnel")
+    parser.add_argument("--squeeze-trigger", type=float, default=3.0, help="Activer trailing stop à +N%%")
+    parser.add_argument("--trailing-stop", type=float, default=1.2, help="Trailing stop: N%% sous le peak")
+    parser.add_argument("--squeeze-interval", type=float, default=2.0, help="Check interval en squeeze (secondes)")
     parser.add_argument("--rotation-adv", type=float, default=0.03, help="Avantage min pour rotation")
     parser.add_argument("--interval", type=int, default=15)
+    parser.add_argument("--max-vol", type=float, default=8.0, help="Max volatilité 24h %% pour directionnel")
     parser.add_argument("--max-hold", type=float, default=72.0)
     
     args = parser.parse_args()
@@ -1067,7 +1497,11 @@ def main():
         capital=args.capital,
         min_funding_pct=args.threshold,
         stop_loss_pct=args.stop_loss,
+        squeeze_threshold_pct=args.squeeze_trigger,
+        trailing_stop_pct=args.trailing_stop,
+        squeeze_check_interval=args.squeeze_interval,
         rotation_advantage_pct=args.rotation_adv,
+        max_volatility_24h=args.max_vol,
         scan_interval=args.interval,
         max_hold_hours=args.max_hold,
     )

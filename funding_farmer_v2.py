@@ -756,11 +756,7 @@ class HLClient:
     
     def place_stop_loss(self, coin: str, is_buy: bool, size: float, 
                         trigger_price: float) -> dict:
-        """Place un stop-loss trigger order sur l'exchange.
-        
-        is_buy: True si on veut acheter (pour fermer un short), False pour vendre (fermer un long)
-        trigger_price: prix qui déclenche le SL (mark price)
-        """
+        """Place un stop-loss trigger order sur l'exchange."""
         if self.config.dry_run or not self._exchange:
             log.info(f"🧪 [DRY] SL {'BUY' if is_buy else 'SELL'} {size} {coin} trigger@${trigger_price:.6f}")
             return {"status": "ok", "dry_run": True}
@@ -769,26 +765,27 @@ class HLClient:
             sz_decimals = self._perp_sz_decimals.get(coin, 2)
             size = round(size, sz_decimals)
             
-            trigger_price = self._round_price(trigger_price, not is_buy)  # Round conservativement
+            # Round trigger price avec 5 sig figs (comme les ordres normaux)
+            trigger_price = self._round_price(trigger_price, not is_buy)
             
-            # SL market order: quand mark price atteint triggerPx, un market order est envoyé
-            # Le limit price doit être très agressif pour s'exécuter (10% slippage comme HL docs)
-            slippage = 0.10  # 10% slippage max pour SL
-            limit_price = trigger_price * (1 + slippage) if is_buy else trigger_price * (1 - slippage)
+            # Limit price très agressif pour garantir le fill
+            slippage = 0.10
+            if is_buy:
+                limit_price = trigger_price * (1 + slippage)
+            else:
+                limit_price = trigger_price * (1 - slippage)
             limit_price = self._round_price(limit_price, is_buy)
-            
-            trigger_px_str = str(trigger_price)
             
             order_type = {
                 "trigger": {
-                    "triggerPx": trigger_px_str,
+                    "triggerPx": str(trigger_price),
                     "isMarket": True,
                     "tpsl": "sl"
                 }
             }
             
-            log.info(f"  🛑 Placement SL on-exchange: {'BUY' if is_buy else 'SELL'} {size} {coin} "
-                     f"trigger@${trigger_price:.6f} limit@${limit_price:.6f}")
+            log.info(f"  🛑 Placement SL: {'BUY' if is_buy else 'SELL'} {size} {coin} "
+                     f"trigger=${trigger_price} limit=${limit_price}")
             
             result = self._exchange.order(
                 coin, is_buy, size, limit_price,
@@ -800,7 +797,9 @@ class HLClient:
             return result
             
         except Exception as e:
-            log.error(f"❌ Erreur SL: {e}")
+            log.error(f"❌ Erreur SL ({coin}): {type(e).__name__}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
             return {"status": "error", "msg": str(e)}
     
     def cancel_trigger_order(self, coin: str, oid: int) -> bool:
@@ -1173,15 +1172,23 @@ class FundingFarmerV2:
         sl_result = self.client.place_stop_loss(coin, sl_is_buy, abs(filled), sl_trigger)
         
         # Extraire l'OID du SL pour pouvoir l'annuler plus tard
+        log.info(f"  🛑 SL brut: {sl_result}")
         try:
-            sl_statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
-            if sl_statuses and "resting" in sl_statuses[0]:
-                self.position.sl_oid = sl_statuses[0]["resting"]["oid"]
-                log.info(f"  🛑 SL on-exchange actif @ ${sl_trigger:.6f} (oid={self.position.sl_oid})")
-            elif sl_statuses:
-                log.info(f"  🛑 SL placé (statut: {sl_statuses[0]})")
+            if sl_result.get("status") == "ok":
+                sl_statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
+                if sl_statuses:
+                    status = sl_statuses[0]
+                    if "resting" in status:
+                        self.position.sl_oid = status["resting"]["oid"]
+                        log.info(f"  🛑 SL on-exchange actif @ ${sl_trigger:.6f} (oid={self.position.sl_oid})")
+                    else:
+                        log.warning(f"  ⚠️ SL status inattendu: {status}")
+                else:
+                    log.warning(f"  ⚠️ SL pas de statuses dans la réponse")
+            else:
+                log.error(f"  ❌ SL rejeté: {sl_result}")
         except Exception as e:
-            log.warning(f"  ⚠️ SL placé mais OID non parsé: {e}")
+            log.warning(f"  ⚠️ SL parsing erreur: {e}")
         
         self.stats.total_trades += 1
         self.stats.directional_trades += 1

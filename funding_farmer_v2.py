@@ -905,6 +905,81 @@ class FundingFarmerV2:
         with open("trades_v2.jsonl", "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
     
+    def _capture_market_state(self, coin: str) -> dict:
+        """Capture l'état complet du marché pour un token. Pour ML."""
+        try:
+            rates = self.client.get_all_funding_rates()
+            coin_data = rates.get(coin, {})
+            
+            sq = self.client.compute_squeeze_score(
+                coin, coin_data.get("funding", 0),
+                coin_data.get("markPx", 0), coin_data.get("oraclePx", 0),
+                coin_data.get("openInterest", 0), coin_data.get("volume24h", 0)
+            )
+            
+            vol = self.client.get_volatility_24h(coin)
+            
+            return {
+                "funding_rate": coin_data.get("funding", 0),
+                "mark_price": coin_data.get("markPx", 0),
+                "oracle_price": coin_data.get("oraclePx", 0),
+                "open_interest": coin_data.get("openInterest", 0),
+                "volume_24h": coin_data.get("volume24h", 0),
+                "premium_pct": sq.get("premium_pct", 0),
+                "squeeze_score": sq.get("total", 0),
+                "squeeze_raw": sq.get("raw_total", 0),
+                "squeeze_components": sq.get("components", {}),
+                "funding_accel": sq.get("funding_accel", 0),
+                "oi_vol_ratio": sq.get("oi_vol_ratio", 0),
+                "recent_move_pct": sq.get("recent_move_pct", 0),
+                "volatility_24h": vol,
+            }
+        except:
+            return {}
+    
+    def _log_snapshot(self):
+        """Log périodique de l'état du marché + position. Toutes les 5 min."""
+        snapshot = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "type": "SNAPSHOT",
+        }
+        
+        if self.position:
+            pos = self.position
+            current_price = self.client.get_mid_price(pos.coin)
+            hold_hours = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() / 3600
+            
+            if pos.perp_size > 0:
+                pnl_pct = (current_price - pos.perp_entry_price) / pos.perp_entry_price * 100
+            else:
+                pnl_pct = (pos.perp_entry_price - current_price) / pos.perp_entry_price * 100
+            
+            position_usd = abs(pos.perp_size) * pos.perp_entry_price
+            pnl_usd = pnl_pct / 100 * position_usd
+            estimated_funding = abs(pos.funding_at_entry) * position_usd * hold_hours
+            
+            snapshot["position"] = {
+                "coin": pos.coin,
+                "direction": pos.direction,
+                "mode": pos.mode,
+                "entry_price": pos.perp_entry_price,
+                "current_price": current_price,
+                "pnl_pct": round(pnl_pct, 4),
+                "pnl_usd": round(pnl_usd, 4),
+                "funding_collected": round(estimated_funding, 4),
+                "hold_hours": round(hold_hours, 2),
+                "squeeze_active": pos.squeeze_active,
+                "peak_pnl_pct": round(pos.peak_pnl_pct, 4),
+            }
+            
+            # Market state du token en position
+            snapshot["market"] = self._capture_market_state(pos.coin)
+        else:
+            snapshot["position"] = None
+        
+        with open("snapshots.jsonl", "a") as f:
+            f.write(json.dumps(snapshot, default=str) + "\n")
+    
     # ====================================================================
     # SCANNING
     # ====================================================================
@@ -1201,6 +1276,9 @@ class FundingFarmerV2:
             "size": filled, "price": price or mark_price,
             "funding_rate": opp.funding_rate, "fee": fee,
             "squeeze_score": opp.squeeze_score, "premium_pct": opp.premium_pct,
+            "volatility_24h": opp.volatility_24h, "funding_accel": opp.funding_accel,
+            "oi_trend": opp.oi_trend, "funding_vol_ratio": opp.funding_vol_ratio,
+            "market_state": self._capture_market_state(coin),
         })
     
     # ====================================================================
@@ -1296,6 +1374,11 @@ class FundingFarmerV2:
             "perp_pnl": perp_pnl, "spot_pnl": spot_pnl,
             "funding": estimated_funding, "fees": pos.total_fees,
             "net": net, "hold_hours": hold_hours,
+            "entry_price": pos.perp_entry_price,
+            "exit_price": perp_exit_price,
+            "squeeze_triggered": pos.squeeze_active,
+            "peak_pnl_pct": pos.peak_pnl_pct,
+            "market_state_exit": self._capture_market_state(pos.coin),
         })
         
         self.position = None
@@ -1325,6 +1408,9 @@ class FundingFarmerV2:
             "mode": pos.mode, "reason": reason,
             "perp_pnl": perp_pnl, "funding": estimated_funding,
             "fees": pos.total_fees, "net": net, "hold_hours": hold_hours,
+            "entry_price": pos.perp_entry_price, "exit_price": exit_price,
+            "squeeze_triggered": pos.squeeze_active,
+            "peak_pnl_pct": pos.peak_pnl_pct,
         })
         self.position = None
     
@@ -1663,6 +1749,7 @@ class FundingFarmerV2:
         
         cycle = 0
         last_full_scan = 0
+        last_snapshot = 0
         
         try:
             while True:
@@ -1735,6 +1822,11 @@ class FundingFarmerV2:
                 # 5. Display
                 if cycle % 10 == 1:
                     self.display_status(opportunities)
+                
+                # 6. Snapshot ML (toutes les 5 min)
+                if now - last_snapshot >= 300:
+                    self._log_snapshot()
+                    last_snapshot = now
                 
                 # Normal speed quand pas de squeeze
                 time.sleep(self.config.scan_interval)

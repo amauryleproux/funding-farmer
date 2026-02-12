@@ -87,7 +87,8 @@ class Config:
     
     # Capital
     capital: float = 77.0
-    max_position_pct: float = 0.90    # 90% du capital
+    max_position_pct: float = 0.90    # 90% du capital pour SQ >= 80
+    min_position_pct: float = 0.50    # 50% du capital pour SQ < 50
     
     # Funding thresholds
     min_funding_pct: float = 0.03     # 0.03%/h minimum pour entrer
@@ -169,8 +170,9 @@ class Opportunity:
     # Squeeze indicators
     squeeze_score: float = 0.0      # Score de squeeze 0-100
     funding_accel: float = 0.0      # Accélération du funding (dernières 6h vs 6h avant)
-    oi_trend: float = 0.0           # Tendance OI (% change sur 24h)  
+    oi_change_2h: float = 0.0       # Delta OI sur 2h en %
     premium_pct: float = 0.0        # Premium mark vs oracle en %
+    price_phase: str = ""           # CONSOLIDATION, TRENDING_DOWN, etc.
 
 
 @dataclass
@@ -244,6 +246,10 @@ class HLClient:
         
         self._load_perp_meta()
         self._load_spot_meta()
+        
+        # OI tracking: {coin: [(timestamp, oi_value), ...]}
+        self._oi_history: dict[str, list[tuple[float, float]]] = {}
+        self._last_oi_snapshot = 0.0
     
     def _load_perp_meta(self):
         try:
@@ -442,23 +448,170 @@ class HLClient:
         except:
             return []
     
+    def snapshot_oi(self, rates: dict):
+        """Stocke un snapshot de l'OI pour tous les tokens. Appelé toutes les ~5min."""
+        now = time.time()
+        if now - self._last_oi_snapshot < 300:  # Max 1 snapshot / 5min
+            return
+        self._last_oi_snapshot = now
+        
+        for coin, data in rates.items():
+            oi = data.get("openInterest", 0)
+            if oi > 0:
+                if coin not in self._oi_history:
+                    self._oi_history[coin] = []
+                self._oi_history[coin].append((now, oi))
+                # Garder max 3h d'historique (36 points à 5min)
+                self._oi_history[coin] = self._oi_history[coin][-36:]
+    
+    def get_oi_change(self, coin: str, hours: float = 2.0) -> float:
+        """Retourne le % de changement d'OI sur les N dernières heures."""
+        history = self._oi_history.get(coin, [])
+        if len(history) < 2:
+            return 0.0
+        
+        now = time.time()
+        cutoff = now - hours * 3600
+        
+        # Trouver le point le plus ancien dans la fenêtre
+        old_points = [h for h in history if h[0] <= cutoff + 600]  # +10min de marge
+        if not old_points:
+            old_points = [history[0]]
+        
+        old_oi = old_points[-1][1]
+        new_oi = history[-1][1]
+        
+        if old_oi > 0:
+            return (new_oi - old_oi) / old_oi * 100
+        return 0.0
+    
+    def detect_price_phase(self, coin: str) -> dict:
+        """
+        Détecte la phase de prix sur les dernières heures.
+        
+        Retourne:
+          phase: "CONSOLIDATION" | "TRENDING_DOWN" | "TRENDING_UP" | "POST_SPIKE" | "UNKNOWN"
+          score_modifier: -20 à +20 (bonus/malus pour le squeeze score)
+          details: {}
+        """
+        try:
+            # 12h de candles 1h
+            start = int((time.time() - 12 * 3600) * 1000)
+            end = int(time.time() * 1000)
+            resp = requests.post(API_URL, json={
+                "type": "candleSnapshot",
+                "req": {"coin": coin, "interval": "1h", "startTime": start, "endTime": end}
+            }, timeout=10)
+            resp.raise_for_status()
+            candles = resp.json()
+            
+            if len(candles) < 6:
+                return {"phase": "UNKNOWN", "score_modifier": 0, "details": {}}
+            
+            closes = [float(c["c"]) for c in candles]
+            highs = [float(c["h"]) for c in candles]
+            lows = [float(c["l"]) for c in candles]
+            
+            current = closes[-1]
+            
+            # --- Détection de spike récent (dernières 2 bougies) ---
+            recent_candles = candles[-2:]
+            max_candle_body = 0
+            for c in recent_candles:
+                o, cl = float(c["o"]), float(c["c"])
+                if o > 0:
+                    body = abs(cl - o) / o * 100
+                    max_candle_body = max(max_candle_body, body)
+            
+            if max_candle_body >= 5:
+                return {
+                    "phase": "POST_SPIKE",
+                    "score_modifier": -15,
+                    "details": {"max_candle_body": max_candle_body}
+                }
+            
+            # --- Analyse de tendance sur 6h ---
+            recent_6h = closes[-6:]
+            price_change_6h = (recent_6h[-1] - recent_6h[0]) / recent_6h[0] * 100
+            
+            # Régression linéaire simple
+            n = len(recent_6h)
+            x_mean = (n - 1) / 2
+            y_mean = sum(recent_6h) / n
+            slope_num = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(recent_6h))
+            slope_den = sum((i - x_mean) ** 2 for i in range(n))
+            slope = slope_num / slope_den if slope_den > 0 else 0
+            slope_pct = slope / y_mean * 100  # % par heure
+            
+            # --- Range / volatilité récente ---
+            range_6h = (max(recent_6h) - min(recent_6h)) / min(recent_6h) * 100
+            
+            # --- Classification ---
+            if range_6h < 2.0 and abs(slope_pct) < 0.3:
+                # Prix plat, basse vol = CONSOLIDATION (idéal pré-squeeze)
+                return {
+                    "phase": "CONSOLIDATION",
+                    "score_modifier": +15,
+                    "details": {"range_6h": range_6h, "slope_pct": slope_pct}
+                }
+            
+            elif slope_pct < -0.5 and price_change_6h < -3:
+                # Chute régulière = tendance baissière (PAS un setup squeeze)
+                # C'est le pattern 0G : funding négatif parce que le prix chute
+                penalty = -10 if price_change_6h > -6 else -20
+                return {
+                    "phase": "TRENDING_DOWN",
+                    "score_modifier": penalty,
+                    "details": {"price_change_6h": price_change_6h, "slope_pct": slope_pct}
+                }
+            
+            elif slope_pct > 0.5 and price_change_6h > 3:
+                # Montée régulière = peut-être début de squeeze OU déjà en cours
+                if price_change_6h > 8:
+                    return {
+                        "phase": "TRENDING_UP",
+                        "score_modifier": -10,  # Trop tard probablement
+                        "details": {"price_change_6h": price_change_6h, "slope_pct": slope_pct}
+                    }
+                else:
+                    return {
+                        "phase": "TRENDING_UP",
+                        "score_modifier": +5,  # Début de squeeze potentiel
+                        "details": {"price_change_6h": price_change_6h, "slope_pct": slope_pct}
+                    }
+            
+            else:
+                # Choppy / indéterminé
+                return {
+                    "phase": "CHOPPY",
+                    "score_modifier": 0,
+                    "details": {"range_6h": range_6h, "slope_pct": slope_pct}
+                }
+                
+        except:
+            return {"phase": "UNKNOWN", "score_modifier": 0, "details": {}}
+    
     def compute_squeeze_score(self, coin: str, funding_rate: float, 
                                mark_price: float, oracle_price: float,
                                open_interest: float, volume_24h: float) -> dict:
         """
-        Calcule un score de squeeze (0-100) basé sur 5 indicateurs.
+        Calcule un score de squeeze (0-100+) basé sur 5 indicateurs + bonus/malus.
         
-        Chaque indicateur est noté de 0 à 20.
-        Plus le score est élevé, plus le squeeze est probable.
+        Indicateurs de base (0-20 chacun, total 0-100):
+          1. Funding magnitude
+          2. Funding acceleration
+          3. Premium mark vs oracle
+          4. OI delta (OI en hausse = shorts qui s'entassent)
+          5. Consistance directionnelle
         
-        Ne fonctionne que pour les fundings négatifs (short squeeze potentiel)
-        ou positifs (long squeeze potentiel).
+        Modificateurs:
+          - Phase de prix: +15 (consolidation) à -20 (chute active)
+          - Post-squeeze penalty: -10 à -60
         """
         scores = {}
         
         # ─── 1. MAGNITUDE DU FUNDING (0-20) ───
-        # Plus le funding est extrême, plus les shorts/longs souffrent
-        abs_funding = abs(funding_rate) * 100  # en %
+        abs_funding = abs(funding_rate) * 100
         if abs_funding >= 0.15:
             scores["funding_magnitude"] = 20
         elif abs_funding >= 0.10:
@@ -471,12 +624,10 @@ class HLClient:
             scores["funding_magnitude"] = 4
         
         # ─── 2. ACCÉLÉRATION DU FUNDING (0-20) ───
-        # Funding qui empire = shorts qui s'entassent = bombe qui se charge
         history = self.get_funding_history(coin, hours=12)
         funding_accel = 0.0
         
         if len(history) >= 6:
-            # Comparer la moyenne des 6 dernières heures vs les 6 précédentes
             recent = history[-6:]
             older = history[-12:-6] if len(history) >= 12 else history[:len(history)//2]
             
@@ -484,9 +635,8 @@ class HLClient:
             avg_older = sum(abs(float(h["fundingRate"])) for h in older) / len(older)
             
             if avg_older > 0:
-                funding_accel = (avg_recent - avg_older) / avg_older * 100  # % d'accélération
+                funding_accel = (avg_recent - avg_older) / avg_older * 100
             
-            # Aussi vérifier la consistance (toutes les heures dans la même direction)
             same_direction = all(
                 (float(h["fundingRate"]) < 0) == (funding_rate < 0) 
                 for h in recent
@@ -499,24 +649,21 @@ class HLClient:
             elif funding_accel > 0 and same_direction:
                 scores["funding_accel"] = 12
             elif same_direction:
-                scores["funding_accel"] = 8  # Stable mais consistant
+                scores["funding_accel"] = 8
             else:
-                scores["funding_accel"] = 2  # Direction mixte
+                scores["funding_accel"] = 2
         else:
-            scores["funding_accel"] = 5  # Pas assez de data
+            scores["funding_accel"] = 5
         
         # ─── 3. PREMIUM MARK vs ORACLE (0-20) ───
-        # Mark < Oracle (funding négatif) = shorts poussent le prix sous la réalité
-        # Plus l'écart est grand, plus la correction sera violente
         premium_pct = 0.0
         if oracle_price > 0:
             premium_pct = (mark_price - oracle_price) / oracle_price * 100
         
-        # Pour un short squeeze, on veut un premium négatif (mark < oracle)
         if funding_rate < 0:
-            abs_premium = abs(min(0, premium_pct))  # Premium négatif seulement
+            abs_premium = abs(min(0, premium_pct))
         else:
-            abs_premium = abs(max(0, premium_pct))  # Premium positif seulement
+            abs_premium = abs(max(0, premium_pct))
         
         if abs_premium >= 1.0:
             scores["premium"] = 20
@@ -529,24 +676,35 @@ class HLClient:
         else:
             scores["premium"] = 3
         
-        # ─── 4. RATIO OI / VOLUME (0-20) ───
-        # OI élevé vs volume = beaucoup de positions ouvertes mais peu de trading
-        # = positions "coincées" qui devront sortir violemment
-        oi_vol_ratio = open_interest / volume_24h if volume_24h > 0 else 0
+        # ─── 4. OI DELTA — OI en hausse = positions qui s'accumulent (0-20) ───
+        oi_change = self.get_oi_change(coin, hours=2.0)
         
-        if oi_vol_ratio >= 0.5:
-            scores["oi_concentration"] = 20
-        elif oi_vol_ratio >= 0.3:
-            scores["oi_concentration"] = 16
-        elif oi_vol_ratio >= 0.15:
-            scores["oi_concentration"] = 12
-        elif oi_vol_ratio >= 0.08:
-            scores["oi_concentration"] = 8
+        # OI qui augmente avec funding extrême = shorts/longs qui s'entassent
+        if oi_change >= 10:
+            scores["oi_delta"] = 20  # OI +10% en 2h = accumulation massive
+        elif oi_change >= 5:
+            scores["oi_delta"] = 16
+        elif oi_change >= 2:
+            scores["oi_delta"] = 12
+        elif oi_change >= 0:
+            scores["oi_delta"] = 8   # OI stable = positions maintenues
+        elif oi_change >= -5:
+            scores["oi_delta"] = 4   # OI qui baisse = positions se ferment (moins de fuel)
         else:
-            scores["oi_concentration"] = 3
+            scores["oi_delta"] = 1   # OI en chute = squeeze déjà en cours ou fini
+        
+        # Fallback si pas assez de data OI
+        if len(self._oi_history.get(coin, [])) < 2:
+            # Utiliser le ratio OI/vol comme proxy
+            oi_vol_ratio = open_interest / volume_24h if volume_24h > 0 else 0
+            if oi_vol_ratio >= 0.5:
+                scores["oi_delta"] = 14
+            elif oi_vol_ratio >= 0.2:
+                scores["oi_delta"] = 10
+            else:
+                scores["oi_delta"] = 6
         
         # ─── 5. CONSISTANCE DIRECTIONNELLE (0-20) ───
-        # Si TOUTES les heures récentes sont dans la même direction = pression constante
         if len(history) >= 12:
             all_entries = [float(h["fundingRate"]) for h in history[-12:]]
             same_sign = all(f < 0 for f in all_entries) or all(f > 0 for f in all_entries)
@@ -570,24 +728,25 @@ class HLClient:
         else:
             scores["consistency"] = 5
         
-        # ─── TOTAL (avant pénalité) ───
+        # ─── TOTAL DE BASE ───
         raw_total = sum(scores.values())
         
-        # ─── 6. PÉNALITÉ: SQUEEZE DÉJÀ EU LIEU (-0 à -60) ───
-        # Si le prix a déjà bougé massivement dans notre direction,
-        # le squeeze est DERRIÈRE nous, pas devant.
+        # ─── 6. PHASE DE PRIX — bonus/malus ───
+        phase = self.detect_price_phase(coin)
+        phase_modifier = phase["score_modifier"]
+        scores["phase"] = phase_modifier
+        
+        # ─── 7. PÉNALITÉ POST-SQUEEZE ───
         recent_move = self._get_recent_move(coin, hours=4)
         
-        # Pour un short squeeze (funding négatif), le move dangereux est UP
-        # Pour un long squeeze (funding positif), le move dangereux est DOWN
         if funding_rate < 0:
-            already_squeezed_pct = max(0, recent_move)   # Move UP = squeeze déjà fait
+            already_squeezed_pct = max(0, recent_move)
         else:
-            already_squeezed_pct = max(0, -recent_move)  # Move DOWN = squeeze déjà fait
+            already_squeezed_pct = max(0, -recent_move)
         
         penalty = 0
         if already_squeezed_pct >= 15:
-            penalty = -60  # Move massif = squeeze terminé, ne pas entrer
+            penalty = -60
         elif already_squeezed_pct >= 10:
             penalty = -45
         elif already_squeezed_pct >= 5:
@@ -596,7 +755,8 @@ class HLClient:
             penalty = -10
         
         scores["post_squeeze_penalty"] = penalty
-        total = max(0, raw_total + penalty)
+        
+        total = max(0, raw_total + phase_modifier + penalty)
         
         return {
             "total": total,
@@ -604,7 +764,9 @@ class HLClient:
             "components": scores,
             "funding_accel": funding_accel,
             "premium_pct": premium_pct,
-            "oi_vol_ratio": oi_vol_ratio,
+            "oi_change_2h": oi_change,
+            "phase": phase["phase"],
+            "phase_details": phase["details"],
             "recent_move_pct": recent_move,
             "already_squeezed_pct": already_squeezed_pct,
         }
@@ -930,7 +1092,8 @@ class FundingFarmerV2:
                 "squeeze_raw": sq.get("raw_total", 0),
                 "squeeze_components": sq.get("components", {}),
                 "funding_accel": sq.get("funding_accel", 0),
-                "oi_vol_ratio": sq.get("oi_vol_ratio", 0),
+                "oi_change_2h": sq.get("oi_change_2h", 0),
+                "price_phase": sq.get("phase", ""),
                 "recent_move_pct": sq.get("recent_move_pct", 0),
                 "volatility_24h": vol,
             }
@@ -1078,17 +1241,20 @@ class FundingFarmerV2:
                 score=score,
                 squeeze_score=squeeze_score,
                 funding_accel=sq["funding_accel"],
-                oi_trend=sq["oi_vol_ratio"],
+                oi_change_2h=sq.get("oi_change_2h", 0),
                 premium_pct=sq["premium_pct"],
+                price_phase=sq.get("phase", ""),
             )
             opportunities.append(opp)
             
             # Log squeeze details pour les top tokens
             penalty_tag = f" ⚠️MOVED {sq['already_squeezed_pct']:+.1f}%" if sq.get("already_squeezed_pct", 0) > 3 else ""
+            phase_tag = sq.get("phase", "?")
+            oi_delta = sq.get("oi_change_2h", 0)
             log.info(f"  📊 {coin}: fund={abs_funding_pct:.3f}%/h "
                      f"SQ={squeeze_score}/100 (raw:{sq['raw_total']}) "
-                     f"prem={sq['premium_pct']:+.2f}% "
-                     f"move4h={sq['recent_move_pct']:+.1f}%{penalty_tag} "
+                     f"phase={phase_tag} OIΔ={oi_delta:+.1f}% "
+                     f"prem={sq['premium_pct']:+.2f}%{penalty_tag} "
                      f"→ score={score:.1f}")
         
         # Trier par score décroissant
@@ -1100,9 +1266,22 @@ class FundingFarmerV2:
     # ====================================================================
     
     def enter_position(self, opp: Opportunity):
-        """Ouvre une position (delta-neutral ou directionnelle)."""
+        """Ouvre une position avec taille dynamique basée sur le squeeze score."""
         coin = opp.coin
-        capital = self.config.max_position_usd
+        
+        # Dynamic sizing: SQ >= 80 → 90%, SQ <= 40 → 50%, linéaire entre
+        if opp.squeeze_score >= 80:
+            size_pct = self.config.max_position_pct
+        elif opp.squeeze_score <= 40:
+            size_pct = self.config.min_position_pct
+        else:
+            # Interpolation linéaire
+            ratio = (opp.squeeze_score - 40) / 40  # 0 à 1
+            size_pct = self.config.min_position_pct + ratio * (self.config.max_position_pct - self.config.min_position_pct)
+        
+        capital = self.config.capital * size_pct
+        
+        log.info(f"  💰 Sizing: SQ={opp.squeeze_score:.0f} → {size_pct*100:.0f}% capital = ${capital:.0f}")
         
         if opp.mode == "DELTA_NEUTRAL" and opp.spot_market:
             self._enter_delta_neutral(opp, capital)
@@ -1211,7 +1390,7 @@ class FundingFarmerV2:
         log.info(f"\n{'='*60}")
         log.info(f"⚡ DIRECTIONAL ENTRY: {opp.direction} {size} {coin}")
         log.info(f"   Funding: {opp.funding_pct:+.4f}%/h | SL: {self.config.stop_loss_pct}%")
-        log.info(f"   Squeeze Score: {opp.squeeze_score:.0f}/100 | Premium: {opp.premium_pct:+.2f}%")
+        log.info(f"   Squeeze Score: {opp.squeeze_score:.0f}/100 | Premium: {opp.premium_pct:+.2f}% | Phase: {opp.price_phase}")
         log.info(f"   Position: ~${capital:.2f}")
         log.info(f"{'='*60}")
         
@@ -1277,7 +1456,8 @@ class FundingFarmerV2:
             "funding_rate": opp.funding_rate, "fee": fee,
             "squeeze_score": opp.squeeze_score, "premium_pct": opp.premium_pct,
             "volatility_24h": opp.volatility_24h, "funding_accel": opp.funding_accel,
-            "oi_trend": opp.oi_trend, "funding_vol_ratio": opp.funding_vol_ratio,
+            "oi_change_2h": opp.oi_change_2h, "funding_vol_ratio": opp.funding_vol_ratio,
+            "price_phase": opp.price_phase,
             "market_state": self._capture_market_state(coin),
         })
     
@@ -1693,9 +1873,10 @@ class FundingFarmerV2:
             for opp in opportunities[:5]:
                 mode_tag = "🛡️DN" if opp.has_spot else "⚡DIR"
                 sq_bar = "🔥" if opp.squeeze_score >= 70 else ("⭐" if opp.squeeze_score >= 50 else "  ")
-                move_warn = f"⚠️{opp.oi_trend:+.0f}%" if hasattr(opp, '_recent_move') else ""
+                phase_short = opp.price_phase[:5] if opp.price_phase else "?"
                 print(f"│  {sq_bar} {opp.coin:<8} {opp.funding_pct:>+.4f}%/h "
                       f"SQ:{opp.squeeze_score:>3.0f}/100 "
+                      f"{phase_short:<5} "
                       f"prem:{opp.premium_pct:>+.2f}% "
                       f"{mode_tag}")
         
@@ -1741,7 +1922,8 @@ class FundingFarmerV2:
         log.info(f"   Stratégie: Delta-Neutral si spot dispo, sinon Directionnel (SL {self.config.stop_loss_pct}%)")
         log.info(f"   Filtre vol: max {self.config.max_volatility_24h}% vol 24h pour directionnel")
         log.info(f"   Squeeze: trailing stop {self.config.trailing_stop_pct}% activé à +{self.config.squeeze_threshold_pct}%")
-        log.info(f"   Scoring: Squeeze Score 0-100 (funding mag + accel + premium + OI/vol + consistance)")
+        log.info(f"   Scoring: Squeeze Score 0-100 (funding + accel + premium + OI delta + consistency + phase)")
+        log.info(f"   Sizing: SQ≥80 → {self.config.max_position_pct*100:.0f}% | SQ≤40 → {self.config.min_position_pct*100:.0f}% | linéaire entre")
         log.info(f"   Rotation: switch si avantage > {self.config.rotation_advantage_pct}%/h")
         log.info(f"   Seuil entrée: {self.config.min_funding_pct}%/h | Sortie: {self.config.exit_funding_pct}%/h")
         log.info(f"   Intervalles: normal={self.config.scan_interval}s | squeeze={self.config.squeeze_check_interval}s")
@@ -1779,7 +1961,11 @@ class FundingFarmerV2:
                 
                 # ─── NORMAL PATH: scan complet ───
                 
-                # 1. Scanner (pas à chaque cycle, c'est lourd avec la vol)
+                # 1. OI snapshot (pour le delta tracking)
+                current_rates = self.client.get_all_funding_rates()
+                self.client.snapshot_oi(current_rates)
+                
+                # 2. Scanner (pas à chaque cycle, c'est lourd avec la vol)
                 opportunities = []
                 if now - last_full_scan >= self.config.scan_interval:
                     opportunities = self.scan_opportunities()

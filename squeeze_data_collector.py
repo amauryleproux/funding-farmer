@@ -166,6 +166,7 @@ def save_candles(
     display_name: str,
     interval: str,
     candles: list[dict],
+    commit: bool = True,
 ):
     """Insère des candles en batch (INSERT OR REPLACE)."""
     if not candles:
@@ -185,10 +186,11 @@ def save_candles(
             for c in candles
         ],
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def save_token_meta(conn: sqlite3.Connection, meta: dict):
+def save_token_meta(conn: sqlite3.Connection, meta: dict, commit: bool = True):
     """Upsert les métadonnées d'un token."""
     conn.execute(
         """INSERT OR REPLACE INTO token_meta
@@ -203,7 +205,8 @@ def save_token_meta(conn: sqlite3.Connection, meta: dict):
             int(time.time() * 1000),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def load_candles_df(
@@ -624,7 +627,8 @@ class SqueezeDataCollector:
 
         # 2. Sauvegarder les métadonnées
         for t in tokens:
-            save_token_meta(self.conn, t)
+            save_token_meta(self.conn, t, commit=False)
+        self.conn.commit()
 
         # 3. Collecter les candles
         for i, token in enumerate(tokens):
@@ -650,13 +654,14 @@ class SqueezeDataCollector:
 
                 if candles:
                     save_candles(
-                        self.conn, "hyperliquid", coin, coin, interval, candles
+                        self.conn, "hyperliquid", coin, coin, interval, candles, commit=False
                     )
                     log.info(f"  → {len(candles)} candles {interval} sauvegardées")
                 else:
                     log.warning(f"  → Aucune candle pour {coin}")
 
                 time.sleep(self.config.hl_request_delay)
+            self.conn.commit()
 
         # 4. Funding rates
         log.info("[HL] Récupération des funding rates...")
@@ -684,7 +689,8 @@ class SqueezeDataCollector:
 
         # 2. Sauvegarder les métadonnées
         for p in pools:
-            save_token_meta(self.conn, p)
+            save_token_meta(self.conn, p, commit=False)
+        self.conn.commit()
 
         # 3. Collecter les candles
         for i, pool in enumerate(pools):
@@ -703,13 +709,14 @@ class SqueezeDataCollector:
 
             if candles:
                 save_candles(
-                    self.conn, "solana", addr, name, "1h", candles
+                    self.conn, "solana", addr, name, "1h", candles, commit=False
                 )
                 log.info(f"  → {len(candles)} candles sauvegardées")
             else:
                 log.warning(f"  → Aucune candle pour {name}")
 
             time.sleep(self.config.gt_request_delay)
+            self.conn.commit()
 
     def scan_squeezes(self) -> list[dict]:
         """
@@ -760,7 +767,7 @@ class SqueezeDataCollector:
 
             try:
                 funding = funding_rates.get(symbol, 0.0)
-                signal = detector.analyze(df, display_name or symbol, funding_rate=funding)
+                signal = detector.analyze(df, symbol, funding_rate=funding)
 
                 # Sauvegarder si intéressant
                 if signal.phase not in (SqueezePhase.NO_SQUEEZE,):

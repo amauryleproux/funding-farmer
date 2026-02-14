@@ -71,18 +71,23 @@ class SqueezeConfig:
     volume_breakout_mult: float = 1.5    # Volume breakout > 1.5x moyenne
     
     # --- Scoring ---
-    min_squeeze_score: float = 0.35       # Score minimum pour "BUILDING"
-    ready_squeeze_score: float = 0.55     # Score minimum pour "READY"
-    firing_score: float = 0.45            # Score minimum + breakout = "FIRING"
+    min_squeeze_score: float = 0.45       # Score minimum pour "BUILDING"
+    ready_squeeze_score: float = 0.70     # Score minimum pour "READY"
+    firing_score: float = 0.50            # Score minimum + breakout = "FIRING"
     
     # --- Direction Prediction ---
     ema_fast: int = 9
     ema_slow: int = 21
     ema_trend: int = 50
     rsi_period: int = 14
-    
+    direction_dead_zone: float = 0.08     # Si biais directionnel < 8% => unknown
+
     # --- Multi-timeframe ---
     timeframes: list[str] = field(default_factory=lambda: ["1h", "4h"])
+
+    # --- Breakout confirmation ---
+    breakout_lookback_bars: int = 20
+    breakout_atr_buffer: float = 0.15     # Filtre faux breakouts
     
     # --- Weights pour le score composite ---
     weight_bb: float = 0.25
@@ -90,6 +95,13 @@ class SqueezeConfig:
     weight_atr: float = 0.20
     weight_volume: float = 0.15
     weight_oi: float = 0.15
+
+
+def _consecutive_true_streak(mask: pd.Series) -> pd.Series:
+    """Retourne la longueur de streak consécutif de valeurs True."""
+    bool_mask = mask.fillna(False).astype(bool)
+    groups = (~bool_mask).cumsum()
+    return bool_mask.astype(np.int32).groupby(groups).cumsum()
 
 
 @dataclass
@@ -157,104 +169,136 @@ def compute_indicators(df: pd.DataFrame, config: SqueezeConfig) -> pd.DataFrame:
     Input DataFrame doit avoir: open, high, low, close, volume
     Optionnel: oi (open interest), funding_rate
     """
+    required = {"open", "high", "low", "close", "volume"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes pour compute_indicators: {sorted(missing)}")
+
     df = df.copy()
-    
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    volume = df["volume"].astype(float)
+    prev_close = close.shift(1)
+
     # === Bollinger Bands ===
-    df['bb_mid'] = df['close'].rolling(config.bb_period).mean()
-    df['bb_std'] = df['close'].rolling(config.bb_period).std()
-    df['bb_upper'] = df['bb_mid'] + config.bb_std * df['bb_std']
-    df['bb_lower'] = df['bb_mid'] - config.bb_std * df['bb_std']
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
-    
-    # BB Width percentile (rolling)
-    df['bb_width_pct'] = df['bb_width'].rolling(config.bb_width_lookback).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False
+    df["bb_mid"] = close.rolling(config.bb_period, min_periods=config.bb_period).mean()
+    df["bb_std"] = close.rolling(config.bb_period, min_periods=config.bb_period).std(ddof=0)
+    df["bb_upper"] = df["bb_mid"] + config.bb_std * df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - config.bb_std * df["bb_std"]
+    bb_span = (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
+    df["bb_width"] = bb_span / df["bb_mid"].replace(0, np.nan)
+    df["bb_width_pct"] = (
+        df["bb_width"]
+        .rolling(config.bb_width_lookback, min_periods=config.bb_width_lookback)
+        .rank(pct=True)
+        * 100
     )
-    
-    # Position du prix dans les BB (0 = lower, 1 = upper)
-    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-    
+    df["bb_position"] = ((close - df["bb_lower"]) / bb_span).clip(-0.5, 1.5)
+
     # === ATR ===
-    tr = pd.DataFrame({
-        'hl': df['high'] - df['low'],
-        'hc': (df['high'] - df['close'].shift(1)).abs(),
-        'lc': (df['low'] - df['close'].shift(1)).abs()
-    }).max(axis=1)
-    df['atr'] = tr.rolling(config.atr_period).mean()
-    df['atr_pct'] = df['atr'] / df['close']
-    
-    # ATR percentile (rolling)
-    df['atr_pct_rank'] = df['atr_pct'].rolling(config.atr_lookback).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["atr"] = tr.ewm(
+        alpha=1 / config.atr_period,
+        adjust=False,
+        min_periods=config.atr_period,
+    ).mean()
+    df["atr_pct"] = df["atr"] / close.replace(0, np.nan)
+    df["atr_pct_rank"] = (
+        df["atr_pct"]
+        .rolling(config.atr_lookback, min_periods=config.atr_lookback)
+        .rank(pct=True)
+        * 100
     )
-    
+
     # === Keltner Channel (pour TTM Squeeze) ===
-    df['kc_mid'] = df['close'].rolling(config.kc_period).mean()
-    df['kc_upper'] = df['kc_mid'] + config.kc_atr_mult * df['atr']
-    df['kc_lower'] = df['kc_mid'] - config.kc_atr_mult * df['atr']
-    
+    df["kc_mid"] = close.ewm(span=config.kc_period, adjust=False).mean()
+    df["kc_upper"] = df["kc_mid"] + config.kc_atr_mult * df["atr"]
+    df["kc_lower"] = df["kc_mid"] - config.kc_atr_mult * df["atr"]
+
     # TTM Squeeze: BB inside KC = squeeze actif
-    df['ttm_squeeze'] = (df['bb_lower'] > df['kc_lower']) & (df['bb_upper'] < df['kc_upper'])
-    
-    # Nombre de bars consécutives en TTM squeeze
-    df['ttm_squeeze_bars'] = 0
-    squeeze_count = 0
-    for i in range(len(df)):
-        if df['ttm_squeeze'].iloc[i]:
-            squeeze_count += 1
-        else:
-            squeeze_count = 0
-        df.iloc[i, df.columns.get_loc('ttm_squeeze_bars')] = squeeze_count
-    
+    df["ttm_squeeze"] = (df["bb_lower"] > df["kc_lower"]) & (df["bb_upper"] < df["kc_upper"])
+    df["ttm_squeeze_bars"] = _consecutive_true_streak(df["ttm_squeeze"]).astype(int)
+
     # === Volume ===
-    df['vol_ma'] = df['volume'].rolling(config.volume_ma_period).mean()
-    df['vol_ratio'] = df['volume'] / df['vol_ma']
-    df['vol_dried'] = df['vol_ratio'] < config.volume_dry_threshold
-    
-    # Volume dry-up consécutif
-    df['vol_dry_streak'] = 0
-    dry_count = 0
-    for i in range(len(df)):
-        if df['vol_dried'].iloc[i]:
-            dry_count += 1
-        else:
-            dry_count = 0
-        df.iloc[i, df.columns.get_loc('vol_dry_streak')] = dry_count
-    
-    # Volume breakout
-    df['vol_breakout'] = df['vol_ratio'] > config.volume_breakout_mult
-    
-    # === EMAs (pour direction) ===
-    df['ema_fast'] = df['close'].ewm(span=config.ema_fast, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=config.ema_slow, adjust=False).mean()
-    df['ema_trend'] = df['close'].ewm(span=config.ema_trend, adjust=False).mean()
-    df['ema_bullish'] = df['ema_fast'] > df['ema_slow']
-    
-    # === RSI ===
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(config.rsi_period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(config.rsi_period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # === Momentum (pour direction du breakout) ===
-    # MACD histogram slope
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-    df['macd_hist_slope'] = df['macd_hist'].diff(3)  # Pente sur 3 bars
-    
-    # Price momentum relatif pendant le squeeze
-    df['price_vs_mid'] = (df['close'] - df['bb_mid']) / df['bb_mid']
-    
+    df["vol_ma"] = volume.rolling(
+        config.volume_ma_period,
+        min_periods=config.volume_ma_period,
+    ).mean()
+    df["vol_ratio"] = volume / df["vol_ma"].replace(0, np.nan)
+    df["vol_dried"] = df["vol_ratio"] < config.volume_dry_threshold
+    df["vol_dry_streak"] = _consecutive_true_streak(df["vol_dried"]).astype(int)
+    vol_std = volume.rolling(50, min_periods=20).std(ddof=0).replace(0, np.nan)
+    df["vol_zscore"] = (volume - volume.rolling(50, min_periods=20).mean()) / vol_std
+    df["vol_breakout"] = (
+        (df["vol_ratio"] > config.volume_breakout_mult)
+        & (df["vol_zscore"].fillna(0) > 1.0)
+    )
+
+    # === EMAs / Trend ===
+    df["ema_fast"] = close.ewm(span=config.ema_fast, adjust=False).mean()
+    df["ema_slow"] = close.ewm(span=config.ema_slow, adjust=False).mean()
+    df["ema_trend"] = close.ewm(span=config.ema_trend, adjust=False).mean()
+    df["ema_bullish"] = df["ema_fast"] > df["ema_slow"]
+    df["ema_spread"] = (df["ema_fast"] - df["ema_slow"]) / close.replace(0, np.nan)
+    df["ema_trend_slope"] = df["ema_trend"].pct_change(5)
+
+    # === RSI (Wilder smoothing) ===
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(
+        alpha=1 / config.rsi_period,
+        adjust=False,
+        min_periods=config.rsi_period,
+    ).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / config.rsi_period,
+        adjust=False,
+        min_periods=config.rsi_period,
+    ).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50.0)
+
+    # === Momentum ===
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    df["macd_hist_slope"] = df["macd_hist"].diff(3)
+    df["price_vs_mid"] = (close - df["bb_mid"]) / df["bb_mid"].replace(0, np.nan)
+    df["ret_3"] = close.pct_change(3)
+    df["ret_8"] = close.pct_change(8)
+    df["ret_21"] = close.pct_change(21)
+
+    # === Breakout levels ===
+    prior_high = high.shift(1).rolling(
+        config.breakout_lookback_bars,
+        min_periods=config.breakout_lookback_bars,
+    ).max()
+    prior_low = low.shift(1).rolling(
+        config.breakout_lookback_bars,
+        min_periods=config.breakout_lookback_bars,
+    ).min()
+    atr_buffer = df["atr"] * config.breakout_atr_buffer
+    df["breakout_up"] = close > (prior_high + atr_buffer)
+    df["breakout_down"] = close < (prior_low - atr_buffer)
+
     # === Open Interest (si disponible) ===
-    if 'oi' in df.columns:
-        df['oi_ma'] = df['oi'].rolling(20).mean()
-        df['oi_ratio'] = df['oi'] / df['oi_ma']
-        df['oi_rising'] = df['oi'].diff(5) > 0  # OI en hausse sur 5 bars
-    
+    if "oi" in df.columns:
+        oi = df["oi"].astype(float)
+        df["oi_ma"] = oi.rolling(20, min_periods=10).mean()
+        df["oi_ratio"] = oi / df["oi_ma"].replace(0, np.nan)
+        df["oi_rising"] = oi.diff(5) > 0
+
     return df
 
 
@@ -268,53 +312,44 @@ def compute_squeeze_score(row: pd.Series, config: SqueezeConfig) -> float:
     Plus le score est élevé, plus le squeeze est "mûr".
     """
     scores = {}
-    
+
     # 1. BB Width score (inversé : plus c'est étroit, plus le score est haut)
-    if pd.notna(row.get('bb_width_pct')):
-        # Percentile 5% → score 1.0, Percentile 50% → score 0.0
-        bb_score = max(0, 1.0 - row['bb_width_pct'] / 50.0)
-        scores['bb'] = min(1.0, bb_score)
+    bb_width_pct = row.get("bb_width_pct")
+    if pd.notna(bb_width_pct):
+        scores["bb"] = float(np.clip((55.0 - bb_width_pct) / 45.0, 0.0, 1.0))
     else:
-        scores['bb'] = 0.0
-    
-    # 2. TTM Squeeze score
-    if row.get('ttm_squeeze', False):
-        # Plus on est en squeeze longtemps, plus c'est prêt à exploser
-        bars = row.get('ttm_squeeze_bars', 0)
-        # Score augmente rapidement les 5 premières bars, puis sature
-        scores['ttm'] = min(1.0, bars / 6.0)
+        scores["bb"] = 0.0
+
+    # 2. TTM Squeeze score avec persistance
+    bars = float(row.get("ttm_squeeze_bars", 0) or 0)
+    if row.get("ttm_squeeze", False):
+        scores["ttm"] = float(np.clip(bars / 8.0, 0.0, 1.0))
     else:
-        scores['ttm'] = 0.0
-    
+        scores["ttm"] = float(np.clip(bars / 20.0, 0.0, 0.4))
+
     # 3. ATR Compression score
-    if pd.notna(row.get('atr_pct_rank')):
-        atr_score = max(0, 1.0 - row['atr_pct_rank'] / 50.0)
-        scores['atr'] = min(1.0, atr_score)
+    atr_rank = row.get("atr_pct_rank")
+    if pd.notna(atr_rank):
+        scores["atr"] = float(np.clip((60.0 - atr_rank) / 50.0, 0.0, 1.0))
     else:
-        scores['atr'] = 0.0
-    
-    # 4. Volume dry-up score
-    vol_streak = row.get('vol_dry_streak', 0)
-    if vol_streak >= config.volume_dry_consecutive:
-        scores['volume'] = min(1.0, vol_streak / 5.0)
-    else:
-        # Partial score si volume est bas mais pas encore consécutif
-        vol_ratio = row.get('vol_ratio', 1.0)
-        if vol_ratio < 0.8:
-            scores['volume'] = 0.3 * (1.0 - vol_ratio)
-        else:
-            scores['volume'] = 0.0
-    
+        scores["atr"] = 0.0
+
+    # 4. Volume dry-up score (ratio + streak)
+    vol_ratio = float(row.get("vol_ratio", 1.0) or 1.0)
+    vol_streak = float(row.get("vol_dry_streak", 0) or 0)
+    ratio_score = float(np.clip((1.0 - vol_ratio) / 0.5, 0.0, 1.0))
+    streak_score = float(np.clip(vol_streak / max(1.0, config.volume_dry_consecutive), 0.0, 1.0))
+    scores["volume"] = 0.55 * ratio_score + 0.45 * streak_score
+
     # 5. Open Interest score (si disponible)
-    if pd.notna(row.get('oi_ratio')):
-        # OI qui monte pendant un squeeze = énergie accumulée
-        if row.get('oi_rising', False) and row['oi_ratio'] > 1.05:
-            scores['oi'] = min(1.0, (row['oi_ratio'] - 1.0) * 5.0)
+    oi_ratio = row.get("oi_ratio")
+    if pd.notna(oi_ratio):
+        if row.get("oi_rising", False) and oi_ratio > 1.01:
+            scores["oi"] = float(np.clip((oi_ratio - 1.0) * 6.0, 0.0, 1.0))
         else:
-            scores['oi'] = 0.0
+            scores["oi"] = 0.0
     else:
-        # Redistribuer le poids OI aux autres
-        scores['oi'] = None
+        scores["oi"] = None
     
     # Weighted average
     weights = {
@@ -328,17 +363,36 @@ def compute_squeeze_score(row: pd.Series, config: SqueezeConfig) -> float:
     total_weight = 0.0
     weighted_sum = 0.0
     
-    for key, score in scores.items():
-        if score is not None:
-            weighted_sum += score * weights[key]
+    for key, component_score in scores.items():
+        if component_score is not None:
+            weighted_sum += component_score * weights[key]
             total_weight += weights[key]
-    
-    if total_weight > 0:
-        return weighted_sum / total_weight
-    return 0.0
+
+    if total_weight == 0:
+        return 0.0
+
+    score = weighted_sum / total_weight
+
+    # Bonus si compression très nette et persistante
+    if (
+        pd.notna(bb_width_pct)
+        and pd.notna(atr_rank)
+        and bb_width_pct <= config.bb_width_percentile
+        and atr_rank <= config.atr_compression_percentile
+    ):
+        score = min(1.0, score + 0.08)
+
+    # En FIRE/EXPANSION, on dégrade le "readiness score"
+    if row.get("vol_breakout", False) and pd.notna(atr_rank) and atr_rank > 65:
+        score *= 0.75
+
+    return float(np.clip(score, 0.0, 1.0))
 
 
-def predict_direction(row: pd.Series) -> tuple[BreakoutDirection, float]:
+def predict_direction(
+    row: pd.Series,
+    config: Optional[SqueezeConfig] = None,
+) -> tuple[BreakoutDirection, float]:
     """
     Prédit la direction probable du breakout.
     Retourne (direction, confidence 0-1).
@@ -349,70 +403,60 @@ def predict_direction(row: pd.Series) -> tuple[BreakoutDirection, float]:
     - MACD histogram slope
     - RSI momentum
     """
-    bull_signals = 0
-    bear_signals = 0
-    total_signals = 0
-    
-    # 1. Prix dans les BB (si prix au-dessus du mid → bullish tendency)
-    bb_pos = row.get('bb_position', 0.5)
-    if pd.notna(bb_pos):
-        total_signals += 1
-        if bb_pos > 0.55:
-            bull_signals += 1
-        elif bb_pos < 0.45:
-            bear_signals += 1
-    
-    # 2. EMA alignment
-    if row.get('ema_bullish', False):
-        bull_signals += 1
-    else:
-        bear_signals += 1
-    total_signals += 1
-    
-    # 3. Prix vs EMA trend (50)
-    if pd.notna(row.get('ema_trend')) and pd.notna(row.get('close')):
-        total_signals += 1
-        if row['close'] > row['ema_trend']:
-            bull_signals += 1
-        else:
-            bear_signals += 1
-    
-    # 4. MACD histogram slope
-    macd_slope = row.get('macd_hist_slope', 0)
-    if pd.notna(macd_slope):
-        total_signals += 1
-        if macd_slope > 0:
-            bull_signals += 1
-        elif macd_slope < 0:
-            bear_signals += 1
-    
-    # 5. RSI momentum
-    rsi = row.get('rsi', 50)
-    if pd.notna(rsi):
-        total_signals += 1
-        if rsi > 55:
-            bull_signals += 1
-        elif rsi < 45:
-            bear_signals += 1
-    
-    # Calculer direction et confidence
-    if total_signals == 0:
+    cfg = config or SqueezeConfig()
+
+    bull_weight = 0.0
+    bear_weight = 0.0
+    total_weight = 0.0
+
+    def vote(value: float, up_threshold: float, down_threshold: float, weight: float):
+        nonlocal bull_weight, bear_weight, total_weight
+        if not pd.notna(value) or weight <= 0:
+            return
+        total_weight += weight
+        if value >= up_threshold:
+            bull_weight += weight
+        elif value <= down_threshold:
+            bear_weight += weight
+
+    # Signaux de tendance (prioritaires)
+    vote(float(row.get("ema_spread", 0.0) or 0.0), 0.0015, -0.0015, 2.0)
+    vote(float(row.get("ema_trend_slope", 0.0) or 0.0), 0.0020, -0.0020, 1.5)
+    vote(
+        float(row.get("close", np.nan)) - float(row.get("ema_trend", np.nan)),
+        0.0,
+        0.0,
+        1.2,
+    )
+
+    # Momentum
+    vote(float(row.get("macd_hist_slope", 0.0) or 0.0), 0.0, 0.0, 1.0)
+    vote(float(row.get("rsi", 50.0) or 50.0), 55.0, 45.0, 0.9)
+    vote(float(row.get("ret_8", 0.0) or 0.0), 0.01, -0.01, 0.9)
+    vote(float(row.get("bb_position", 0.5) or 0.5), 0.56, 0.44, 0.8)
+
+    # Breakout confirmé a un poids important
+    if row.get("breakout_up", False):
+        bull_weight += 2.1
+        total_weight += 2.1
+    elif row.get("breakout_down", False):
+        bear_weight += 2.1
+        total_weight += 2.1
+
+    if total_weight <= 0:
         return BreakoutDirection.UNKNOWN, 0.0
-    
-    bull_ratio = bull_signals / total_signals
-    bear_ratio = bear_signals / total_signals
-    
-    if bull_ratio > bear_ratio:
-        confidence = bull_ratio
-        direction = BreakoutDirection.LONG
-    elif bear_ratio > bull_ratio:
-        confidence = bear_ratio
-        direction = BreakoutDirection.SHORT
-    else:
-        confidence = 0.0
-        direction = BreakoutDirection.UNKNOWN
-    
-    return direction, confidence
+
+    dominance = abs(bull_weight - bear_weight) / total_weight
+    confidence = max(bull_weight, bear_weight) / total_weight
+
+    if dominance < cfg.direction_dead_zone:
+        return BreakoutDirection.UNKNOWN, confidence * 0.5
+
+    if bull_weight > bear_weight:
+        return BreakoutDirection.LONG, float(np.clip(confidence, 0.0, 0.99))
+    if bear_weight > bull_weight:
+        return BreakoutDirection.SHORT, float(np.clip(confidence, 0.0, 0.99))
+    return BreakoutDirection.UNKNOWN, 0.0
 
 
 def determine_phase(
@@ -425,43 +469,52 @@ def determine_phase(
     Détermine la phase actuelle du cycle de volatilité.
     Utilise le score + les indicateurs de breakout + la phase précédente.
     """
-    is_ttm = row.get('ttm_squeeze', False)
-    vol_breakout = row.get('vol_breakout', False)
-    bb_width_pct = row.get('bb_width_pct', 50)
-    
-    # FIRING: Score élevé + breakout (volume + prix sort des BB)
-    # Peut transitioner depuis BUILDING, READY, ou même NO_SQUEEZE si signal fort
-    bb_pos = row.get('bb_position', 0.5)
-    price_outside_bb = pd.notna(bb_pos) and (bb_pos > 0.95 or bb_pos < 0.05)
-    
-    if vol_breakout and price_outside_bb and score >= config.firing_score:
+    vol_breakout = bool(row.get("vol_breakout", False))
+    bb_width_pct = row.get("bb_width_pct", 50)
+    bb_pos = row.get("bb_position", 0.5)
+    ttm_bars = int(row.get("ttm_squeeze_bars", 0) or 0)
+    breakout_up = bool(row.get("breakout_up", False))
+    breakout_down = bool(row.get("breakout_down", False))
+    directional_breakout = breakout_up or breakout_down
+    price_outside_bb = pd.notna(bb_pos) and (bb_pos > 0.9 or bb_pos < 0.1)
+
+    # FIRING: breakout confirmé
+    if (
+        directional_breakout
+        and vol_breakout
+        and score >= config.firing_score * 0.85
+    ):
         return SqueezePhase.FIRING
-    
+
+    # Transition vers FIRING plus permissive après BUILDING/READY
     if prev_phase in (SqueezePhase.BUILDING, SqueezePhase.READY):
-        if vol_breakout and (bb_pos > 0.85 or bb_pos < 0.15):
+        if vol_breakout and (directional_breakout or price_outside_bb):
             return SqueezePhase.FIRING
-    
-    # EXPANSION: Post-breakout, volatilité encore haute
+
+    # EXPANSION: volatilité relâchée après firing
     if prev_phase == SqueezePhase.FIRING:
-        if pd.notna(bb_width_pct) and bb_width_pct > 60:
+        if pd.notna(bb_width_pct) and bb_width_pct >= 62:
             return SqueezePhase.EXPANSION
-        return SqueezePhase.FIRING  # Reste en firing si width pas encore élevée
-    
-    # COOLING: Après expansion, volatilité redescend
+        return SqueezePhase.FIRING
+
+    # COOLING: la vol retombe
     if prev_phase == SqueezePhase.EXPANSION:
-        if pd.notna(bb_width_pct) and bb_width_pct < 50:
+        if pd.notna(bb_width_pct) and bb_width_pct <= 45 and not vol_breakout:
             return SqueezePhase.COOLING
         return SqueezePhase.EXPANSION
-    
-    # READY: Score très élevé
-    if score >= config.ready_squeeze_score:
+
+    # READY: compression forte + persistance
+    if score >= config.ready_squeeze_score and ttm_bars >= 2:
         return SqueezePhase.READY
-    
-    # BUILDING: Score moyen
+
+    # BUILDING: compression en cours
     if score >= config.min_squeeze_score:
         return SqueezePhase.BUILDING
-    
-    # NO_SQUEEZE: Score trop bas, ou on sort du cooling
+
+    # Réamorçage depuis cooling
+    if prev_phase == SqueezePhase.COOLING and score >= config.min_squeeze_score * 0.9:
+        return SqueezePhase.BUILDING
+
     return SqueezePhase.NO_SQUEEZE
 
 
@@ -514,6 +567,31 @@ class SqueezeDetector:
     def __init__(self, config: Optional[SqueezeConfig] = None):
         self.config = config or SqueezeConfig()
         self._phase_cache: dict[str, SqueezePhase] = {}  # coin → last phase
+        self._last_analysis_cache: dict[str, tuple[tuple[int, int, int], pd.Series]] = {}
+
+    @staticmethod
+    def _make_cache_key(df: pd.DataFrame) -> tuple[int, int, int]:
+        """Clé stable (bars, dernier timestamp/int index, dernier close)."""
+        n_rows = len(df)
+        if n_rows == 0:
+            return (0, 0, 0)
+
+        try:
+            close_fp = int(float(df["close"].iloc[-1]) * 1_000_000)
+        except Exception:
+            close_fp = 0
+
+        last_idx = df.index[-1]
+        if isinstance(last_idx, pd.Timestamp):
+            return (n_rows, int(last_idx.value), close_fp)
+
+        if "t" in df.columns:
+            try:
+                return (n_rows, int(df["t"].iloc[-1]), close_fp)
+            except Exception:
+                pass
+
+        return (n_rows, int(n_rows), close_fp)
     
     def analyze(
         self,
@@ -533,17 +611,23 @@ class SqueezeDetector:
         Returns:
             SqueezeSignal avec toutes les métriques
         """
-        # Calculer les indicateurs
-        df_ind = compute_indicators(df, self.config)
-        
-        # Prendre la dernière ligne
-        last = df_ind.iloc[-1]
+        cache_key = self._make_cache_key(df)
+        cached = self._last_analysis_cache.get(coin)
+        if cached and cached[0] == cache_key:
+            last = cached[1]
+        else:
+            # Calculer les indicateurs
+            df_ind = compute_indicators(df, self.config)
+
+            # Prendre la dernière ligne
+            last = df_ind.iloc[-1].copy()
+            self._last_analysis_cache[coin] = (cache_key, last)
         
         # Score composite
         score = compute_squeeze_score(last, self.config)
         
         # Direction prédite
-        direction, confidence = predict_direction(last)
+        direction, confidence = predict_direction(last, self.config)
         
         # Phase du cycle
         prev_phase = self._phase_cache.get(coin, SqueezePhase.NO_SQUEEZE)
@@ -561,9 +645,14 @@ class SqueezeDetector:
         else:
             funding_predicted = "unknown"
         
+        if isinstance(last.name, pd.Timestamp):
+            ts = float(last.name.timestamp())
+        else:
+            ts = 0.0
+
         return SqueezeSignal(
             coin=coin,
-            timestamp=last.name if hasattr(last.name, 'timestamp') else 0,
+            timestamp=ts,
             phase=phase,
             score=score,
             direction=direction,
@@ -689,7 +778,7 @@ def backtest_squeeze_signals(
         if not in_position:
             # Score et direction
             score = compute_squeeze_score(row, config)
-            dir_pred, confidence = predict_direction(row)
+            dir_pred, confidence = predict_direction(row, config)
             
             # Phase tracking
             coin_key = "backtest"
@@ -700,18 +789,29 @@ def backtest_squeeze_signals(
             # Condition d'entrée : squeeze READY/FIRING + direction claire
             # OU : BUILDING avec score élevé + volume breakout
             vol_breakout = row.get('vol_breakout', False)
+            expected_move = estimate_expected_move(row)
+            trend_ok = (
+                (dir_pred == BreakoutDirection.LONG and row.get("close", 0) > row.get("ema_trend", np.inf))
+                or (dir_pred == BreakoutDirection.SHORT and row.get("close", 0) < row.get("ema_trend", -np.inf))
+            )
             can_enter = (
                 (phase in (SqueezePhase.READY, SqueezePhase.FIRING))
                 or (phase == SqueezePhase.BUILDING and score >= 0.5 and vol_breakout)
             )
-            
+            min_conf = 0.62 if phase == SqueezePhase.READY else 0.55
+
             if (can_enter
                 and dir_pred != BreakoutDirection.UNKNOWN
-                and confidence >= 0.55):
+                and confidence >= min_conf
+                and expected_move >= 0.02
+                and trend_ok):
                 
                 in_position = True
                 direction = dir_pred
-                entry_price = price * (1 + slippage_bps / 10000)
+                if direction == BreakoutDirection.LONG:
+                    entry_price = price * (1 + slippage_bps / 10000)
+                else:
+                    entry_price = price * (1 - slippage_bps / 10000)
                 entry_idx = i
                 highest_since_entry = price
                 lowest_since_entry = price

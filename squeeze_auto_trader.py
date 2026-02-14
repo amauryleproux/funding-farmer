@@ -46,6 +46,7 @@ from squeeze_detector import (
 from squeeze_data_collector import (
     CollectorConfig, HyperliquidFetcher, SolanaFetcher,
     init_db, save_candles, load_candles_df, save_token_meta,
+    get_latest_timestamp,
 )
 
 
@@ -83,6 +84,9 @@ class TraderConfig:
     min_squeeze_score: float = 0.55       # Score minimum pour entrer
     min_direction_confidence: float = 0.6 # Confiance direction minimum
     min_volume_ratio: float = 0.3         # Volume ratio minimum
+    min_expected_move_pct: float = 0.02   # Move attendu minimum (2%)
+    min_ready_confidence: float = 0.62    # READY demande plus de certitude
+    min_firing_confidence: float = 0.55   # FIRING peut être légèrement plus souple
     required_phases: list[str] = field(
         default_factory=lambda: ["ready", "firing"]
     )
@@ -588,22 +592,44 @@ class SqueezeAutoTrader:
 
             # Sauvegarder meta
             for t in tokens:
-                save_token_meta(self.conn, t)
+                save_token_meta(self.conn, t, commit=False)
+            self.conn.commit()
 
-            # Candles : seulement les dernières 12h (pas l'historique complet)
+            # Candles : incrémental depuis la dernière bougie stockée
             now_ms = int(time.time() * 1000)
-            start_ms = now_ms - (12 * 3600 * 1000)  # 12h back
 
             updated = 0
+            skipped = 0
             errors = 0
             for i, token in enumerate(tokens):
                 coin = token["symbol"]
                 try:
+                    latest_ts = get_latest_timestamp(
+                        self.conn, "hyperliquid", coin, "1h"
+                    )
+                    if latest_ts:
+                        start_ms = latest_ts + 1
+                        # Evite les requêtes inutiles quand la dernière bougie est déjà récente.
+                        if start_ms >= (now_ms - 55 * 60 * 1000):
+                            skipped += 1
+                            continue
+                    else:
+                        # Historique minimal utile pour warm-up des indicateurs.
+                        start_ms = now_ms - (120 * 3600 * 1000)
+
                     candles = self.hl_fetcher.fetch_candles(
                         coin, "1h", start_time=start_ms, end_time=now_ms
                     )
                     if candles:
-                        save_candles(self.conn, "hyperliquid", coin, coin, "1h", candles)
+                        save_candles(
+                            self.conn,
+                            "hyperliquid",
+                            coin,
+                            coin,
+                            "1h",
+                            candles,
+                            commit=False,
+                        )
                         updated += 1
                 except Exception as e:
                     errors += 1
@@ -613,14 +639,25 @@ class SqueezeAutoTrader:
                         log.warning(f"  Rate limited, waiting {wait:.0f}s...")
                         time.sleep(wait)
 
-                # 1s entre chaque requête (safe pour HL)
-                time.sleep(1.0)
+                # Commit batch toutes les 25 lignes pour réduire le coût I/O.
+                if (i + 1) % 25 == 0:
+                    self.conn.commit()
+
+                # Délai API safe
+                time.sleep(0.8)
 
                 # Log progress tous les 50 tokens
                 if (i + 1) % 50 == 0:
-                    log.info(f"  Progress: {i+1}/{len(tokens)} ({updated} OK, {errors} erreurs)")
+                    log.info(
+                        f"  Progress: {i+1}/{len(tokens)} "
+                        f"({updated} OK, {skipped} skip, {errors} erreurs)"
+                    )
 
-            log.info(f"📊 {updated}/{len(tokens)} tokens mis à jour ({errors} erreurs)")
+            self.conn.commit()
+            log.info(
+                f"📊 {updated}/{len(tokens)} tokens mis à jour "
+                f"({skipped} déjà à jour, {errors} erreurs)"
+            )
 
         except Exception as e:
             log.error(f"Erreur update données: {e}")
@@ -668,9 +705,14 @@ class SqueezeAutoTrader:
             s for s in signals
             if s.phase.value in self.config.required_phases
             and s.direction != BreakoutDirection.UNKNOWN
-            and s.direction_confidence >= self.config.min_direction_confidence
+            and s.direction_confidence >= (
+                max(self.config.min_direction_confidence, self.config.min_ready_confidence)
+                if s.phase == SqueezePhase.READY
+                else max(self.config.min_direction_confidence, self.config.min_firing_confidence)
+            )
             and s.score >= self.config.min_squeeze_score
             and s.volume_ratio >= self.config.min_volume_ratio
+            and s.expected_move_pct >= self.config.min_expected_move_pct
         ]
 
         if actionable:
@@ -702,9 +744,16 @@ class SqueezeAutoTrader:
                 continue
             if signal.direction == BreakoutDirection.UNKNOWN:
                 continue
-            if signal.direction_confidence < self.config.min_direction_confidence:
+            min_conf = self.config.min_direction_confidence
+            if signal.phase == SqueezePhase.READY:
+                min_conf = max(min_conf, self.config.min_ready_confidence)
+            elif signal.phase == SqueezePhase.FIRING:
+                min_conf = max(min_conf, self.config.min_firing_confidence)
+            if signal.direction_confidence < min_conf:
                 continue
             if signal.volume_ratio < self.config.min_volume_ratio:
+                continue
+            if signal.expected_move_pct < self.config.min_expected_move_pct:
                 continue
 
             coin = signal.coin
@@ -734,8 +783,9 @@ class SqueezeAutoTrader:
                 continue
 
             # Exposition totale ?
+            next_exposure = self.config.max_position_usd * self.config.leverage
             current_exposure = sum(p.size_usd for p in self.positions.values())
-            if current_exposure + self.config.max_position_usd > self.config.max_total_exposure_usd:
+            if current_exposure + next_exposure > self.config.max_total_exposure_usd:
                 continue
 
             # ✅ ENTRER

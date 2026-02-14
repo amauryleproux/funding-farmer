@@ -218,6 +218,7 @@ class HyperliquidExecutor:
         self._exchange = None
         self._info = None
         self._sz_decimals: dict[str, int] = {}
+        self._price_decimals: dict[str, int] = {}
         self._meta_loaded = False
 
         if not dry_run and secret_key:
@@ -262,13 +263,57 @@ class HyperliquidExecutor:
             for asset in meta.get("universe", []):
                 name = asset.get("name", "")
                 self._sz_decimals[name] = asset.get("szDecimals", 2)
+                # Tick size: derive price decimals from the asset
+                # Hyperliquid uses "significantFigures" or we infer from price
+                self._price_decimals[name] = self._get_price_decimals(asset)
             self._meta_loaded = True
         except Exception as e:
             log.error(f"Erreur chargement meta: {e}")
 
+    @staticmethod
+    def _get_price_decimals(asset: dict) -> int:
+        """Determine price decimals from asset metadata."""
+        # Hyperliquid tick sizes vary per asset
+        # We use significant figures approach based on typical price ranges
+        # Most assets: 5 significant figures for price
+        # This will be refined with actual mid prices
+        return 6  # Safe default, will be refined in round_price
+
     def get_sz_decimals(self, coin: str) -> int:
         self._load_meta()
         return self._sz_decimals.get(coin, 2)
+
+    def round_price(self, coin: str, price: float) -> float:
+        """
+        Round price to valid tick size for Hyperliquid.
+        Rules: max 5 significant figures, and integer if price >= 100K
+        """
+        if price <= 0:
+            return price
+
+        # Hyperliquid rule: 5 significant figures
+        if price >= 100_000:
+            return round(price)
+        elif price >= 10_000:
+            return round(price, 1)
+        elif price >= 1_000:
+            return round(price, 2)
+        elif price >= 100:
+            return round(price, 3)
+        elif price >= 10:
+            return round(price, 4)
+        elif price >= 1:
+            return round(price, 5)
+        else:
+            # For sub-$1 prices, find appropriate decimals
+            # e.g., 0.046784 → 5 sig figs → 0.046784 is 5 sig figs
+            import math
+            if price > 0:
+                magnitude = math.floor(math.log10(abs(price)))
+                decimals = 5 - 1 - magnitude  # 5 sig figs
+                decimals = max(0, min(8, decimals))
+                return round(price, decimals)
+            return price
 
     def round_size(self, coin: str, size: float) -> float:
         dec = self.get_sz_decimals(coin)
@@ -336,11 +381,12 @@ class HyperliquidExecutor:
             return {"success": False, "error": "size_zero"}
 
         # Prix agressif pour fill immédiat (±0.5% du mid)
+        # Round to valid tick size for Hyperliquid
         slippage = 0.005
         if is_buy:
-            limit_price = round(current_price * (1 + slippage), 6)
+            limit_price = self.round_price(coin, current_price * (1 + slippage))
         else:
-            limit_price = round(current_price * (1 - slippage), 6)
+            limit_price = self.round_price(coin, current_price * (1 - slippage))
 
         side_str = "BUY" if is_buy else "SELL"
         log.info(f"📤 ORDER | {side_str} {coin} | size={size} (~${size_usd:.0f}) | px={limit_price}")

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: Funding farmer bot for Hyperliquid\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nFix order execution: proper price rounding and fill verification\n\n- Add _round_price\\(\\) for Hyperliquid 5 significant figures requirement\n- Increase market order slippage to 0.5% for reliable fills\n- Verify order fill status before recording position\n- Use actual fill price instead of mark price for entry\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd funding_farmer_v2.py\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit:*)"
+    ]
+  }
+}

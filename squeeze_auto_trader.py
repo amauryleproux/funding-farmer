@@ -77,7 +77,7 @@ class TraderConfig:
     # --- Capital & Sizing ---
     max_position_usd: float = 30.0        # Taille max par position
     max_positions: int = 2                 # Max positions simultanées
-    max_total_exposure_usd: float = 80.0  # Exposition totale max
+    max_total_exposure_usd: float = 200  # Exposition totale max
     leverage: float = 3.0                 # Levier
 
     # --- Entry Conditions ---

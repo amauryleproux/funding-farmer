@@ -77,7 +77,7 @@ class TraderConfig:
     # --- Capital & Sizing ---
     max_position_usd: float = 30.0        # Taille max par position
     max_positions: int = 2                 # Max positions simultanées
-    max_total_exposure_usd: float = 200  # Exposition totale max
+    max_total_exposure_usd: float = 200.0  # Exposition totale max
     leverage: float = 3.0                 # Levier
 
     # --- Entry Conditions ---
@@ -731,6 +731,40 @@ class SqueezeAutoTrader:
     # SIGNAL PROCESSING → TRADE ENTRY
     # =========================================================================
 
+    def _compute_funding_adjustment(self, signal) -> tuple[float, float]:
+        """
+        Calcule l'ajustement basé sur le funding rate.
+        
+        Logique:
+          - LONG + funding négatif = shorts crowdés, on est payé → BOOST
+          - LONG + funding positif = longs crowdés, on paye → RÉDUCTION
+          - SHORT + funding positif = longs crowdés, on est payé → BOOST
+          - SHORT + funding négatif = shorts crowdés, on paye → RÉDUCTION
+        
+        Returns:
+            (confidence_adjustment, size_multiplier)
+            confidence_adjustment: -0.15 à +0.15
+            size_multiplier: 0.5x à 1.5x
+        """
+        funding = signal.current_funding  # Taux horaire
+        is_long = signal.direction == BreakoutDirection.LONG
+        
+        # alignment > 0 = favorable (on trade contre le crowd, on est payé)
+        # alignment < 0 = défavorable (on trade avec le crowd, on paye)
+        alignment = -funding if is_long else funding
+        
+        # Normalisation: 0.0003/h (0.03%/h) = signal fort
+        # Cap à ±1.0
+        scale = max(-1.0, min(1.0, alignment / 0.0003))
+        
+        # Ajustement confiance: ±15% max
+        conf_adj = scale * 0.15
+        
+        # Multiplicateur taille: 0.5x (très défavorable) à 1.5x (très favorable)
+        size_mult = 1.0 + scale * 0.5
+        
+        return conf_adj, size_mult
+
     def _process_signals(self, signals: list[SqueezeSignal]):
         """Traite les signaux et entre en position si conditions remplies."""
         if self.config.alert_only:
@@ -744,12 +778,16 @@ class SqueezeAutoTrader:
                 continue
             if signal.direction == BreakoutDirection.UNKNOWN:
                 continue
+            # Calcul ajustement funding
+            funding_conf_adj, funding_size_mult = self._compute_funding_adjustment(signal)
+            adjusted_confidence = signal.direction_confidence + funding_conf_adj
+
             min_conf = self.config.min_direction_confidence
             if signal.phase == SqueezePhase.READY:
                 min_conf = max(min_conf, self.config.min_ready_confidence)
             elif signal.phase == SqueezePhase.FIRING:
                 min_conf = max(min_conf, self.config.min_firing_confidence)
-            if signal.direction_confidence < min_conf:
+            if adjusted_confidence < min_conf:
                 continue
             if signal.volume_ratio < self.config.min_volume_ratio:
                 continue
@@ -782,16 +820,20 @@ class SqueezeAutoTrader:
             if self.daily_pnl <= -self.config.max_daily_loss_usd:
                 continue
 
-            # Exposition totale ?
-            next_exposure = self.config.max_position_usd * self.config.leverage
+            # Exposition totale (ajustée par funding)
+            adjusted_size = self.config.max_position_usd * funding_size_mult
+            next_exposure = adjusted_size * self.config.leverage
             current_exposure = sum(p.size_usd for p in self.positions.values())
             if current_exposure + next_exposure > self.config.max_total_exposure_usd:
                 continue
 
-            # ✅ ENTRER
-            self._enter_position(signal)
+            # ✅ ENTRER (avec taille ajustée par funding)
+            self._enter_position(signal, size_override=adjusted_size,
+                                 funding_conf_adj=funding_conf_adj,
+                                 funding_size_mult=funding_size_mult)
 
-    def _enter_position(self, signal: SqueezeSignal):
+    def _enter_position(self, signal: SqueezeSignal, size_override: float = 0,
+                       funding_conf_adj: float = 0, funding_size_mult: float = 1.0):
         """Ouvre une position basée sur un signal de squeeze."""
         coin = signal.coin
         is_long = signal.direction == BreakoutDirection.LONG
@@ -814,16 +856,26 @@ class SqueezeAutoTrader:
             stop_price = price + self.config.stop_loss_atr_mult * atr
             tp_price = price - self.config.take_profit_atr_mult * atr
 
-        size_usd = self.config.max_position_usd * self.config.leverage
+        base_size = size_override if size_override > 0 else self.config.max_position_usd
+        size_usd = base_size * self.config.leverage
+
+        # Funding alignment info
+        funding = signal.current_funding
+        if is_long:
+            funding_status = "✅ PAYÉ" if funding < 0 else "❌ PAYE" if funding > 0 else "➖ NEUTRE"
+        else:
+            funding_status = "✅ PAYÉ" if funding > 0 else "❌ PAYE" if funding < 0 else "➖ NEUTRE"
 
         log.info("=" * 60)
         log.info(f"🎯 SIGNAL DÉTECTÉ — {coin}")
         log.info(f"  Phase: {signal.phase.value} | Score: {signal.score:.2f}")
         log.info(f"  Direction: {'LONG 📈' if is_long else 'SHORT 📉'} "
                  f"(conf: {signal.direction_confidence:.0%})")
+        log.info(f"  💰 Funding: {funding:+.4%}/h | {funding_status} "
+                 f"| Conf adj: {funding_conf_adj:+.0%} | Size mult: {funding_size_mult:.2f}x")
         log.info(f"  Prix: {price} | ATR: {atr:.4f}")
         log.info(f"  Stop: {stop_price:.4f} | TP: {tp_price:.4f}")
-        log.info(f"  Size: ${size_usd:.0f} ({self.config.leverage}x)")
+        log.info(f"  Size: ${size_usd:.0f} (base ${base_size:.0f} × {self.config.leverage}x)")
         log.info(f"  Expected move: {signal.expected_move_pct:.1%}")
         log.info("=" * 60)
 

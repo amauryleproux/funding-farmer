@@ -12,8 +12,14 @@ Usage:
   # Collecte initiale complète (peut prendre 10-15 min)
   python squeeze_data_collector.py --collect-all
 
+  # Collecte initiale étendue (ex: 2 ans d'historique HL en 1h)
+  python squeeze_data_collector.py --collect-all --hl-only --hl-backfill-days 730
+
+  # Collecte multi-timeframes Hyperliquid
+  python squeeze_data_collector.py --collect-all --hl-only --hl-backfill-days 365 --hl-intervals 15m,30m,1h
+
   # Collecte incrémentale (à lancer en cron toutes les heures)
-  python squeeze_data_collector.py --update
+  python squeeze_data_collector.py --update --hl-only --hl-intervals 15m,30m,1h
 
   # Scanner les squeezes sur les données collectées
   python squeeze_data_collector.py --scan
@@ -25,6 +31,8 @@ Usage:
   python squeeze_data_collector.py --live --interval 300
 =============================================================================
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -56,6 +64,8 @@ log = logging.getLogger("squeeze_collector")
 # CONFIG
 # =============================================================================
 
+VALID_HL_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d"}
+
 @dataclass
 class CollectorConfig:
     """Configuration du collecteur."""
@@ -67,6 +77,7 @@ class CollectorConfig:
     hl_base_url: str = "https://api.hyperliquid.xyz/info"
     hl_intervals: list[str] = field(default_factory=lambda: ["1h"])
     hl_candle_limit: int = 5000  # Max par requête
+    hl_backfill_days: int = 208  # 5000 bougies 1h ~= 208 jours
     hl_min_volume_24h: float = 100_000  # $100K min volume
     hl_max_volume_24h: float = 50_000_000  # $50M max (éviter BTC/ETH)
     hl_request_delay: float = 1.0  # Délai entre requêtes (rate limit safe)
@@ -374,6 +385,61 @@ class HyperliquidFetcher:
 
         return candles
 
+    def fetch_candles_backfill(
+        self,
+        coin: str,
+        interval: str = "1h",
+        backfill_days: int = 208,
+        end_time: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Récupère un historique plus long en paginant des requêtes de 5000 bougies.
+        """
+        if backfill_days <= 0:
+            return []
+
+        interval_ms = self._interval_to_ms(interval)
+        now_ms = int(time.time() * 1000)
+        cursor_end = end_time if end_time is not None else now_ms
+        target_start = cursor_end - (backfill_days * 86_400_000)
+
+        by_ts: dict[int, dict] = {}
+        batch_count = 0
+        max_batches = max(1, int((backfill_days * 24) / self.config.hl_candle_limit) + 4)
+
+        while batch_count < max_batches and cursor_end > target_start:
+            start_time = max(
+                target_start,
+                cursor_end - (self.config.hl_candle_limit * interval_ms),
+            )
+            candles = self.fetch_candles(
+                coin,
+                interval=interval,
+                start_time=start_time,
+                end_time=cursor_end,
+            )
+            batch_count += 1
+            if not candles:
+                break
+
+            candles.sort(key=lambda c: c["t"])
+            for c in candles:
+                by_ts[int(c["t"])] = c
+
+            oldest_ts = int(candles[0]["t"])
+            if oldest_ts <= target_start:
+                break
+
+            next_end = oldest_ts - interval_ms
+            if next_end >= cursor_end:
+                break
+            cursor_end = next_end
+            time.sleep(self.config.hl_request_delay)
+
+        merged = list(by_ts.values())
+        merged.sort(key=lambda c: c["t"])
+        return merged
+
     def fetch_funding_rates(self) -> dict[str, float]:
         """Récupère les funding rates actuels pour tous les tokens."""
         try:
@@ -641,16 +707,19 @@ class SqueezeDataCollector:
 
             for interval in self.config.hl_intervals:
                 if full:
-                    start_time = None  # Remonter au max
+                    candles = self.hl.fetch_candles_backfill(
+                        coin,
+                        interval=interval,
+                        backfill_days=self.config.hl_backfill_days,
+                    )
                 else:
                     latest = get_latest_timestamp(
                         self.conn, "hyperliquid", coin, interval
                     )
                     start_time = latest + 1 if latest else None
-
-                candles = self.hl.fetch_candles(
-                    coin, interval=interval, start_time=start_time
-                )
+                    candles = self.hl.fetch_candles(
+                        coin, interval=interval, start_time=start_time
+                    )
 
                 if candles:
                     save_candles(
@@ -660,7 +729,8 @@ class SqueezeDataCollector:
                 else:
                     log.warning(f"  → Aucune candle pour {coin}")
 
-                time.sleep(self.config.hl_request_delay)
+                if not full:
+                    time.sleep(self.config.hl_request_delay)
             self.conn.commit()
 
         # 4. Funding rates
@@ -964,17 +1034,39 @@ def main():
         help="Volume maximum 24h pour Hyperliquid (default: 50M)",
     )
     parser.add_argument(
+        "--hl-backfill-days", type=int, default=208,
+        help="Historique HL en jours pour --collect-all (default: 208)",
+    )
+    parser.add_argument(
+        "--hl-intervals", type=str, default="1h",
+        help="Intervalles HL separes par virgule (ex: 15m,30m,1h)",
+    )
+    parser.add_argument(
         "--stats", action="store_true",
         help="Afficher les stats de la base",
     )
 
     args = parser.parse_args()
 
+    raw_intervals = [x.strip() for x in args.hl_intervals.split(",") if x.strip()]
+    hl_intervals = [x for x in raw_intervals if x in VALID_HL_INTERVALS]
+    if not hl_intervals:
+        print(
+            "Erreur: aucun intervalle HL valide. "
+            "Exemple: --hl-intervals 15m,30m,1h"
+        )
+        return
+    if len(hl_intervals) != len(raw_intervals):
+        invalid = [x for x in raw_intervals if x not in VALID_HL_INTERVALS]
+        log.warning(f"Intervalles HL ignores (invalides): {invalid}")
+
     # Config
     config = CollectorConfig(
         db_path=args.db,
+        hl_intervals=hl_intervals,
         hl_min_volume_24h=args.min_vol,
         hl_max_volume_24h=args.max_vol,
+        hl_backfill_days=max(1, args.hl_backfill_days),
     )
     collector = SqueezeDataCollector(config)
 

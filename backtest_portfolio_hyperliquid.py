@@ -79,15 +79,16 @@ def ms_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def resolve_dataset_range(db_path: Path) -> tuple[Optional[int], Optional[int]]:
+def resolve_dataset_range(db_path: Path, interval: str = "1h") -> tuple[Optional[int], Optional[int]]:
     conn = sqlite3.connect(str(db_path))
     try:
         row = conn.execute(
             """
             SELECT MIN(timestamp), MAX(timestamp)
             FROM candles
-            WHERE source = 'hyperliquid' AND interval = '1h'
-            """
+            WHERE source = 'hyperliquid' AND interval = ?
+            """,
+            (interval,),
         ).fetchone()
         if not row:
             return None, None
@@ -98,6 +99,7 @@ def resolve_dataset_range(db_path: Path) -> tuple[Optional[int], Optional[int]]:
 
 def load_symbols(
     conn: sqlite3.Connection,
+    interval: str,
     min_candles: int,
     min_volume: float,
     max_tokens: int,
@@ -109,9 +111,9 @@ def load_symbols(
         FROM candles c
         LEFT JOIN token_meta tm
           ON tm.source = c.source AND tm.symbol = c.symbol
-        WHERE c.source = 'hyperliquid' AND c.interval = '1h'
+        WHERE c.source = 'hyperliquid' AND c.interval = ?
     """
-    params: list[object] = []
+    params: list[object] = [interval]
     if start_ms is not None:
         query += " AND c.timestamp >= ?"
         params.append(start_ms)
@@ -134,15 +136,16 @@ def load_symbols(
 def load_symbol_df(
     conn: sqlite3.Connection,
     symbol: str,
+    interval: str,
     start_ms: Optional[int],
     end_ms: Optional[int],
 ) -> pd.DataFrame:
     query = """
         SELECT timestamp as t, open, high, low, close, volume
         FROM candles
-        WHERE source = 'hyperliquid' AND interval = '1h' AND symbol = ?
+        WHERE source = 'hyperliquid' AND interval = ? AND symbol = ?
     """
-    params: list[object] = [symbol]
+    params: list[object] = [interval, symbol]
     if start_ms is not None:
         query += " AND timestamp >= ?"
         params.append(start_ms)
@@ -298,6 +301,19 @@ def pattern_rules_passed(args: argparse.Namespace, row: pd.Series, expected_move
 
 def apply_runtime_defaults(args: argparse.Namespace) -> None:
     defaults: dict[str, object] = {
+        "interval": "1h",
+        "entry_mode": "squeeze",
+        "min_entry_score": 0.45,
+        "breakout_min_vol_ratio": 1.2,
+        "breakout_require_trend": False,
+        "ema_cross_require_trend": False,
+        "ema_cross_min_trend_slope": 0.0005,
+        "rsi_revert_long_rsi": 35.0,
+        "rsi_revert_short_rsi": 65.0,
+        "rsi_revert_long_bb_pos_max": 0.20,
+        "rsi_revert_short_bb_pos_min": 0.80,
+        "rsi_revert_trend_filter": False,
+        "rsi_revert_max_adverse_trend_slope": 0.0015,
         "min_squeeze_score_long": -1.0,
         "min_squeeze_score_short": -1.0,
         "min_direction_confidence_long": -1.0,
@@ -448,6 +464,7 @@ def run_portfolio_backtest(
 
     symbols = load_symbols(
         conn,
+        interval=args.interval,
         min_candles=args.min_candles,
         min_volume=args.min_volume,
         max_tokens=args.max_tokens,
@@ -473,7 +490,7 @@ def run_portfolio_backtest(
     min_needed = max(args.min_candles, args.warmup_bars + 1)
 
     for symbol in symbols:
-        df = load_symbol_df(conn, symbol, start_ms, end_ms)
+        df = load_symbol_df(conn, symbol, args.interval, start_ms, end_ms)
         if len(df) < min_needed:
             continue
         ind = compute_indicators(df, detector_cfg)
@@ -702,46 +719,179 @@ def run_portfolio_backtest(
                 filter_stats["whitelist_ok"] += 1
 
                 score = compute_squeeze_score(row, detector_cfg)
-                direction, confidence = predict_direction(row, detector_cfg)
+                direction = BreakoutDirection.UNKNOWN
+                confidence = 0.0
                 prev_phase = phase_cache[symbol]
-                phase = determine_phase(row, prev_phase, score, detector_cfg)
-                phase_cache[symbol] = phase
+                phase = SqueezePhase.NO_SQUEEZE
                 expected_move = estimate_expected_move(row)
                 vol_ratio = float(row.get("vol_ratio", 0.0) or 0.0)
 
-                if phase not in required_phases:
-                    continue
-                filter_stats["phase_ok"] += 1
-                if direction == BreakoutDirection.UNKNOWN:
-                    continue
-                filter_stats["direction_ok"] += 1
+                if args.entry_mode == "squeeze":
+                    direction, confidence = predict_direction(row, detector_cfg)
+                    phase = determine_phase(row, prev_phase, score, detector_cfg)
+                    phase_cache[symbol] = phase
 
-                min_score, min_conf_side, min_vol_ratio, min_expected_move = side_filters(args, direction)
-                if score < min_score:
-                    continue
-                filter_stats["score_ok"] += 1
+                    if phase not in required_phases:
+                        continue
+                    filter_stats["phase_ok"] += 1
+                    if direction == BreakoutDirection.UNKNOWN:
+                        continue
+                    filter_stats["direction_ok"] += 1
 
-                min_conf = min_conf_side
-                if phase == SqueezePhase.READY:
-                    min_conf = max(min_conf, args.min_ready_confidence)
-                elif phase == SqueezePhase.FIRING:
-                    min_conf = max(min_conf, args.min_firing_confidence)
-                if confidence < min_conf:
+                    min_score, min_conf_side, min_vol_ratio, min_expected_move = side_filters(args, direction)
+                    if score < min_score:
+                        continue
+                    filter_stats["score_ok"] += 1
+
+                    min_conf = min_conf_side
+                    if phase == SqueezePhase.READY:
+                        min_conf = max(min_conf, args.min_ready_confidence)
+                    elif phase == SqueezePhase.FIRING:
+                        min_conf = max(min_conf, args.min_firing_confidence)
+                    if confidence < min_conf:
+                        continue
+                    filter_stats["confidence_ok"] += 1
+                    if vol_ratio < min_vol_ratio:
+                        continue
+                    filter_stats["volume_ok"] += 1
+                    if expected_move < min_expected_move:
+                        continue
+                    filter_stats["move_ok"] += 1
+
+                elif args.entry_mode == "breakout":
+                    is_up = bool(row.get("breakout_up", False))
+                    is_down = bool(row.get("breakout_down", False))
+                    if is_up == is_down:
+                        continue
+                    direction = BreakoutDirection.LONG if is_up else BreakoutDirection.SHORT
+                    filter_stats["phase_ok"] += 1
+                    filter_stats["direction_ok"] += 1
+
+                    if vol_ratio < args.breakout_min_vol_ratio:
+                        continue
+                    filter_stats["volume_ok"] += 1
+                    if expected_move < args.min_expected_move_pct:
+                        continue
+                    filter_stats["move_ok"] += 1
+
+                    ret3 = abs(float(row.get("ret_3", 0.0) or 0.0))
+                    confidence = float(
+                        min(0.99, 0.50 + min(0.25, vol_ratio / 5.0) + min(0.20, ret3 * 20.0))
+                    )
+                    score = float(
+                        min(1.0, 0.45 + min(0.25, ret3 * 25.0) + min(0.30, max(0.0, vol_ratio - 1.0)))
+                    )
+                    if score < args.min_entry_score:
+                        continue
+                    filter_stats["score_ok"] += 1
+                    if confidence < args.min_direction_confidence:
+                        continue
+                    filter_stats["confidence_ok"] += 1
+
+                elif args.entry_mode == "ema_cross":
+                    if i <= 0:
+                        continue
+                    prev_row = state["df"].iloc[i - 1]
+                    prev_spread = float(prev_row.get("ema_fast", 0.0) or 0.0) - float(
+                        prev_row.get("ema_slow", 0.0) or 0.0
+                    )
+                    curr_spread = float(row.get("ema_fast", 0.0) or 0.0) - float(
+                        row.get("ema_slow", 0.0) or 0.0
+                    )
+                    cross_up = prev_spread <= 0 and curr_spread > 0
+                    cross_down = prev_spread >= 0 and curr_spread < 0
+                    if not cross_up and not cross_down:
+                        continue
+                    direction = BreakoutDirection.LONG if cross_up else BreakoutDirection.SHORT
+                    filter_stats["phase_ok"] += 1
+                    filter_stats["direction_ok"] += 1
+
+                    if vol_ratio < args.min_volume_ratio:
+                        continue
+                    filter_stats["volume_ok"] += 1
+                    if expected_move < args.min_expected_move_pct:
+                        continue
+                    filter_stats["move_ok"] += 1
+
+                    trend_slope = float(row.get("ema_trend_slope", 0.0) or 0.0)
+                    if args.ema_cross_require_trend:
+                        if direction == BreakoutDirection.LONG and trend_slope < args.ema_cross_min_trend_slope:
+                            continue
+                        if direction == BreakoutDirection.SHORT and trend_slope > -args.ema_cross_min_trend_slope:
+                            continue
+
+                    spread_norm = abs(float(row.get("ema_spread", 0.0) or 0.0))
+                    confidence = float(min(0.99, 0.50 + min(0.35, spread_norm * 120.0)))
+                    score = float(min(1.0, 0.45 + min(0.40, spread_norm * 150.0)))
+                    if score < args.min_entry_score:
+                        continue
+                    filter_stats["score_ok"] += 1
+                    if confidence < args.min_direction_confidence:
+                        continue
+                    filter_stats["confidence_ok"] += 1
+
+                elif args.entry_mode == "rsi_reversion":
+                    rsi = float(row.get("rsi", 50.0) or 50.0)
+                    bb_pos = float(row.get("bb_position", 0.5) or 0.5)
+                    if rsi <= args.rsi_revert_long_rsi and bb_pos <= args.rsi_revert_long_bb_pos_max:
+                        direction = BreakoutDirection.LONG
+                        stretch = max(
+                            (args.rsi_revert_long_rsi - rsi) / max(1.0, args.rsi_revert_long_rsi),
+                            (args.rsi_revert_long_bb_pos_max - bb_pos) / max(0.05, args.rsi_revert_long_bb_pos_max),
+                        )
+                    elif rsi >= args.rsi_revert_short_rsi and bb_pos >= args.rsi_revert_short_bb_pos_min:
+                        direction = BreakoutDirection.SHORT
+                        stretch = max(
+                            (rsi - args.rsi_revert_short_rsi) / max(1.0, 100.0 - args.rsi_revert_short_rsi),
+                            (bb_pos - args.rsi_revert_short_bb_pos_min) / max(
+                                0.05, 1.0 - args.rsi_revert_short_bb_pos_min
+                            ),
+                        )
+                    else:
+                        continue
+
+                    filter_stats["phase_ok"] += 1
+                    filter_stats["direction_ok"] += 1
+
+                    if vol_ratio < args.min_volume_ratio:
+                        continue
+                    filter_stats["volume_ok"] += 1
+                    if expected_move < args.min_expected_move_pct:
+                        continue
+                    filter_stats["move_ok"] += 1
+
+                    if args.rsi_revert_trend_filter:
+                        trend_slope = float(row.get("ema_trend_slope", 0.0) or 0.0)
+                        limit = abs(args.rsi_revert_max_adverse_trend_slope)
+                        if direction == BreakoutDirection.LONG and trend_slope < -limit:
+                            continue
+                        if direction == BreakoutDirection.SHORT and trend_slope > limit:
+                            continue
+
+                    confidence = float(min(0.99, 0.55 + min(0.30, stretch)))
+                    score = float(min(1.0, 0.50 + min(0.35, stretch)))
+                    if score < args.min_entry_score:
+                        continue
+                    filter_stats["score_ok"] += 1
+                    if confidence < args.min_direction_confidence:
+                        continue
+                    filter_stats["confidence_ok"] += 1
+                else:
                     continue
-                filter_stats["confidence_ok"] += 1
-                if vol_ratio < min_vol_ratio:
-                    continue
-                filter_stats["volume_ok"] += 1
-                if expected_move < min_expected_move:
-                    continue
-                filter_stats["move_ok"] += 1
 
                 ema_trend = float(row.get("ema_trend", 0.0) or 0.0)
                 close_price = float(row["close"])
-                trend_ok = (
-                    (direction == BreakoutDirection.LONG and close_price > ema_trend)
-                    or (direction == BreakoutDirection.SHORT and close_price < ema_trend)
-                )
+                if args.entry_mode == "rsi_reversion":
+                    trend_ok = True
+                elif args.entry_mode == "breakout" and (not args.breakout_require_trend):
+                    trend_ok = True
+                elif args.entry_mode == "ema_cross" and (not args.ema_cross_require_trend):
+                    trend_ok = True
+                else:
+                    trend_ok = (
+                        (direction == BreakoutDirection.LONG and close_price > ema_trend)
+                        or (direction == BreakoutDirection.SHORT and close_price < ema_trend)
+                    )
                 if not trend_ok:
                     continue
                 filter_stats["trend_ok"] += 1
@@ -917,6 +1067,8 @@ def run_portfolio_backtest(
         print("PORTFOLIO BACKTEST - SQUEEZE HYPERLIQUID")
         print("=" * 95)
         print(f"DB: {args.db}")
+        print(f"Interval: {args.interval}")
+        print(f"Entry mode: {args.entry_mode}")
         print(
             f"Periode: {ms_to_iso(start_ms) if start_ms else 'debut'} -> "
             f"{ms_to_iso(end_ms) if end_ms else 'fin'}"
@@ -961,7 +1113,7 @@ def run_portfolio_backtest(
 
 
 def run_walk_forward(args: argparse.Namespace, user_start_ms: Optional[int], user_end_ms: Optional[int]) -> int:
-    ds_start, ds_end = resolve_dataset_range(Path(args.db))
+    ds_start, ds_end = resolve_dataset_range(Path(args.db), args.interval)
     if ds_start is None or ds_end is None:
         print("Impossible de lire la plage temporelle de la base.")
         return 1
@@ -1135,6 +1287,7 @@ def run() -> int:
     parser.add_argument("--db", type=str, default="squeeze_data.db")
     parser.add_argument("--start", type=str, default="")
     parser.add_argument("--end", type=str, default="")
+    parser.add_argument("--interval", type=str, default="1h")
     parser.add_argument("--max-tokens", type=int, default=30)
     parser.add_argument("--min-candles", type=int, default=500)
     parser.add_argument("--min-volume", type=float, default=100_000)
@@ -1151,6 +1304,18 @@ def run() -> int:
     parser.add_argument("--min-firing-confidence", type=float, default=0.55)
     parser.add_argument("--min-volume-ratio", type=float, default=0.30)
     parser.add_argument("--min-expected-move-pct", type=float, default=0.02)
+    parser.add_argument("--entry-mode", type=str, choices=["squeeze", "breakout", "ema_cross", "rsi_reversion"], default="squeeze")
+    parser.add_argument("--min-entry-score", type=float, default=0.45)
+    parser.add_argument("--breakout-min-vol-ratio", type=float, default=1.2)
+    parser.add_argument("--breakout-require-trend", action="store_true")
+    parser.add_argument("--ema-cross-require-trend", action="store_true")
+    parser.add_argument("--ema-cross-min-trend-slope", type=float, default=0.0005)
+    parser.add_argument("--rsi-revert-long-rsi", type=float, default=35.0)
+    parser.add_argument("--rsi-revert-short-rsi", type=float, default=65.0)
+    parser.add_argument("--rsi-revert-long-bb-pos-max", type=float, default=0.20)
+    parser.add_argument("--rsi-revert-short-bb-pos-min", type=float, default=0.80)
+    parser.add_argument("--rsi-revert-trend-filter", action="store_true")
+    parser.add_argument("--rsi-revert-max-adverse-trend-slope", type=float, default=0.0015)
     parser.add_argument("--min-squeeze-score-long", type=float, default=-1.0)
     parser.add_argument("--min-squeeze-score-short", type=float, default=-1.0)
     parser.add_argument("--min-direction-confidence-long", type=float, default=-1.0)

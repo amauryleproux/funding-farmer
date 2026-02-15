@@ -104,6 +104,19 @@ Avec les fees Hyperliquid (maker: 1.5 bps, taker: 4.5 bps) :
 
 ## Backtest Squeeze (Hyperliquid)
 
+Pour augmenter la profondeur historique avant backtest:
+
+```bash
+# Exemple: backfill Hyperliquid sur 2 ans (si l'API dispose de l'historique)
+python squeeze_data_collector.py --collect-all --hl-only --hl-backfill-days 730
+
+# Exemple multi-timeframes (15m, 30m et 1h)
+python squeeze_data_collector.py --collect-all --hl-only --hl-backfill-days 365 --hl-intervals 15m,30m,1h
+
+# Update incrémental multi-timeframes
+python squeeze_data_collector.py --update --hl-only --hl-intervals 15m,30m,1h
+```
+
 Backtest de la stratégie squeeze sur les candles historiques stockées en SQLite:
 
 ```bash
@@ -135,6 +148,7 @@ Ce mode simule les contraintes réelles du bot:
 ```bash
 python3 backtest_portfolio_hyperliquid.py \
   --db squeeze_data.db \
+  --interval 1h \
   --max-tokens 30 \
   --initial-capital 1000 \
   --export-trades portfolio_trades.csv \
@@ -146,6 +160,7 @@ Exemple setup "pattern reproductible" (issu des diagnostics token):
 ```bash
 python3 backtest_portfolio_hyperliquid.py \
   --db squeeze_data.db \
+  --interval 1h \
   --start 2025-07-19 --end 2026-02-12 \
   --max-tokens 25 --min-candles 200 \
   --min-squeeze-score 0.60 \
@@ -173,6 +188,7 @@ Découpe l'historique en fenêtres train/test glissantes pour mesurer la robuste
 ```bash
 python3 backtest_portfolio_hyperliquid.py \
   --db squeeze_data.db \
+  --interval 1h \
   --walk-forward \
   --wf-train-days 120 \
   --wf-test-days 30 \
@@ -185,6 +201,7 @@ Avec optimisation train-only (petite grille, puis test OOS):
 ```bash
 python3 backtest_portfolio_hyperliquid.py \
   --db squeeze_data.db \
+  --interval 1h \
   --walk-forward \
   --wf-optimize \
   --wf-train-days 120 \
@@ -192,6 +209,26 @@ python3 backtest_portfolio_hyperliquid.py \
   --wf-step-days 30 \
   --wf-max-candidates 40 \
   --export-wf walk_forward_results.csv
+```
+
+## Benchmark Multi-Timeframes / Multi-Stratégies
+
+```bash
+python3 benchmark_timeframes_strategies.py \
+  --db squeeze_data.db \
+  --intervals 15m,30m,1h \
+  --window-mode both \
+  --export strategy_timeframe_benchmark.csv
+```
+
+## Presets Prod Par Timeframe
+
+Lance les presets recommandés sur toute la plage disponible de chaque timeframe:
+
+```bash
+python3 run_prod_timeframe_presets.py \
+  --db squeeze_data.db \
+  --export prod_timeframe_results.csv
 ```
 
 ## Diagnostic des patterns par token

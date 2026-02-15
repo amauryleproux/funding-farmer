@@ -335,6 +335,7 @@ def run() -> int:
     parser.add_argument("--db", type=str, default="squeeze_data.db")
     parser.add_argument("--start", type=str, default="")
     parser.add_argument("--end", type=str, default="")
+    parser.add_argument("--interval", type=str, default="1h")
     parser.add_argument("--wf-schemes", type=str, default="120:30:30,90:20:20")
     parser.add_argument("--max-candidates", type=int, default=60)
     parser.add_argument("--top-k", type=int, default=10)
@@ -422,7 +423,7 @@ def run() -> int:
         print("Aucun schema walk-forward valide (--wf-schemes).")
         return 1
 
-    ds_start, ds_end = resolve_dataset_range(db_path)
+    ds_start, ds_end = resolve_dataset_range(db_path, args.interval)
     if ds_start is None or ds_end is None:
         print("Impossible de lire la plage de donnees hyperliquid.")
         return 1
@@ -439,7 +440,7 @@ def run() -> int:
     print("=" * 110)
     print(
         f"Range: {args.start or 'debut'} -> {args.end or 'fin'} | "
-        f"Schemes={args.wf_schemes} | Candidats={len(candidates)}"
+        f"Interval={args.interval} | Schemes={args.wf_schemes} | Candidats={len(candidates)}"
     )
     print("-" * 110)
 

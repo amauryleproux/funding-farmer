@@ -45,9 +45,10 @@ def compounded_return(returns_pct: list[float]) -> float:
     return (c - 1.0) * 100.0
 
 
-def make_base_args(db: str) -> argparse.Namespace:
+def make_base_args(db: str, interval: str) -> argparse.Namespace:
     return argparse.Namespace(
         db=db,
+        interval=interval,
         start="",
         end="",
         max_tokens=25,
@@ -206,6 +207,7 @@ def run() -> int:
     parser.add_argument("--db", type=str, default="squeeze_data.db")
     parser.add_argument("--start", type=str, default="2025-07-19")
     parser.add_argument("--end", type=str, default="2026-02-12")
+    parser.add_argument("--interval", type=str, default="1h")
     parser.add_argument("--candidates", type=int, default=40)
     parser.add_argument("--stage2-top", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
@@ -218,7 +220,7 @@ def run() -> int:
         return 1
 
     rng = random.Random(args.seed)
-    base_args = make_base_args(args.db)
+    base_args = make_base_args(args.db, args.interval)
     wf90 = wf_windows_90()
     wf120 = wf_windows_120()
 

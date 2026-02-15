@@ -1,0 +1,20 @@
+<svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <rect width="80" height="80" rx="16" fill="#0A0E1A"/>
+  
+  <!-- Outer radar ring -->
+  <circle cx="40" cy="40" r="32" stroke="#00F0FF" stroke-width="1.5" opacity="0.25"/>
+  <!-- Middle radar ring -->
+  <circle cx="40" cy="40" r="22" stroke="#00F0FF" stroke-width="1.5" opacity="0.45"/>
+  <!-- Inner radar ring -->
+  <circle cx="40" cy="40" r="12" stroke="#00F0FF" stroke-width="1.5" opacity="0.7"/>
+  <!-- Center dot -->
+  <circle cx="40" cy="40" r="4" fill="#00F0FF"/>
+  
+  <!-- Pulse wave (ECG line) -->
+  <path d="M8 40 L20 40 L25 28 L30 52 L35 18 L40 58 L45 30 L50 46 L55 40 L72 40" 
+        stroke="#00F0FF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  
+  <!-- Direction arrow (green) -->
+  <path d="M60 18 L66 10 L62 20" stroke="#00FF88" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

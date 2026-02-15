@@ -107,6 +107,11 @@ class HyperPulseConfig:
     signal_ttl_hours: int = 24          # Résoudre les signaux après 24h
     cooldown_per_token_min: int = 120   # Min 2h entre deux alertes pour le même token
 
+    # --- Scheduled messages ---
+    daily_summary_hour_utc: int = 21    # 21h UTC = 23h Paris
+    morning_briefing_hour_utc: int = 8  # 8h UTC = 10h Paris
+    send_resolution_alerts: bool = True # Envoyer une alerte quand un signal est résolu
+
     # --- Free tier limits ---
     free_max_alerts_per_day: int = 5
     free_top_n_tokens: int = 15         # Top 15 par volume seulement
@@ -391,23 +396,126 @@ def format_signal_alert(
     return msg
 
 
-def format_daily_summary(stats: dict) -> str:
+def format_daily_summary(stats: dict, top_signals: list = None) -> str:
     """Format daily summary message."""
+    total = stats.get('total', 0)
+    wins = stats.get('wins', 0)
+    losses = stats.get('losses', 0)
+    expired = stats.get('expired', 0)
+    wr = stats.get('win_rate', 0)
+    avg_pnl = stats.get('avg_pnl_pct', 0)
+
+    # Header with date
+    date_str = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+
     msg = (
-        f"📊 *HyperPulse — Résumé du jour*\n"
+        f"📊 *HyperPulse — Résumé du {date_str}*\n"
         f"\n"
-        f"Signaux émis: {stats.get('total', 0)}\n"
+        f"*Signaux émis:* {total}\n"
         f"  ├ Long: {stats.get('longs', 0)} | Short: {stats.get('shorts', 0)}\n"
-        f"  ├ Résolus: {stats.get('resolved', 0)}\n"
-        f"  ├ ✅ Wins: {stats.get('wins', 0)}\n"
-        f"  ├ ❌ Losses: {stats.get('losses', 0)}\n"
-        f"  └ ⏰ Expirés: {stats.get('expired', 0)}\n"
-        f"\n"
-        f"Win rate: {stats.get('win_rate', 0):.0f}%\n"
-        f"Score moyen: {stats.get('avg_score', 0):.2f}\n"
-        f"\n"
-        f"_hyper-pulse.xyz — See the squeeze before it fires._"
+        f"  ├ ✅ Wins: {wins}\n"
+        f"  ├ ❌ Losses: {losses}\n"
+        f"  └ ⏰ Expirés: {expired}\n"
     )
+
+    if wins + losses > 0:
+        msg += (
+            f"\n"
+            f"*Performance:*\n"
+            f"  ├ Win rate: *{wr:.0f}%*\n"
+            f"  ├ PnL moyen: `{avg_pnl:+.2f}%`\n"
+            f"  └ Score moyen: `{stats.get('avg_score', 0):.2f}`\n"
+        )
+
+    # Top signals of the day
+    if top_signals:
+        msg += f"\n*Meilleurs signaux:*\n"
+        for s in top_signals[:5]:
+            emoji = "✅" if "win" in (s.get("result") or "") else "❌" if s.get("result") else "⏳"
+            pnl = s.get("pnl_pct", 0)
+            msg += f"  {emoji} {s['coin']} {s['direction'].upper()} → `{pnl:+.1%}`\n"
+
+    # All-time stats
+    all_time = stats.get("all_time", {})
+    if all_time.get("total", 0) > 0:
+        msg += (
+            f"\n*All-time ({all_time['total']} signaux):*\n"
+            f"  Win rate: *{all_time.get('win_rate', 0):.0f}%*\n"
+        )
+
+    msg += f"\n_hyper-pulse.xyz — See the squeeze before it fires._"
+    return msg
+
+
+def format_resolution_alert(
+    coin: str,
+    direction: str,
+    entry_price: float,
+    exit_price: float,
+    pnl_pct: float,
+    result: str,
+    duration_hours: float,
+    score: float,
+) -> str:
+    """Format a signal resolution alert."""
+    is_win = "win" in result
+    emoji = "✅" if is_win else "❌"
+    dir_emoji = "📈" if direction == "long" else "📉"
+    result_text = "TARGET ✅" if result == "win" else "STOP ❌" if result == "loss" else f"EXPIRÉ {'✅' if is_win else '❌'}"
+
+    msg = (
+        f"{emoji} *RÉSULTAT — {coin}/USDC*\n"
+        f"\n"
+        f"{dir_emoji} {direction.upper()} | Score: `{score:.2f}`\n"
+        f"💵 Entry: `${entry_price:.4f}` → Exit: `${exit_price:.4f}`\n"
+        f"📊 PnL: *{pnl_pct:+.1%}*\n"
+        f"⏱ Durée: {duration_hours:.1f}h\n"
+        f"🏁 {result_text}"
+    )
+    return msg
+
+
+def format_morning_briefing(
+    building_signals: list,
+    active_signals: list,
+    market_stats: dict,
+) -> str:
+    """Format morning briefing with watchlist."""
+    date_str = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
+
+    msg = f"☀️ *HyperPulse — Briefing {date_str}*\n"
+
+    # Active (unresolved) signals
+    if active_signals:
+        msg += f"\n*📍 Positions ouvertes ({len(active_signals)}):*\n"
+        for s in active_signals[:5]:
+            dir_emoji = "📈" if s["direction"] == "long" else "📉"
+            pnl = s.get("current_pnl_pct", 0)
+            pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+            msg += f"  {dir_emoji} {s['coin']} → {pnl_emoji} `{pnl:+.1%}`\n"
+
+    # Building squeezes (watchlist)
+    if building_signals:
+        msg += f"\n*👀 Squeezes en formation ({len(building_signals)}):*\n"
+        for s in building_signals[:8]:
+            ttm = "🔵" if s.get("ttm_squeeze") else "⚪"
+            msg += (
+                f"  {ttm} {s['coin']} — score `{s['score']:.2f}` "
+                f"| BB `P{s.get('bb_pct', 50):.0f}` "
+                f"| TTM {s.get('ttm_bars', 0)} bars\n"
+            )
+    else:
+        msg += f"\n_Aucun squeeze en formation pour le moment._\n"
+
+    # Market overview
+    if market_stats:
+        msg += (
+            f"\n*📈 Marché:*\n"
+            f"  Tokens scannés: {market_stats.get('total_tokens', 0)}\n"
+            f"  Funding moyen: `{market_stats.get('avg_funding', 0):+.4f}%/h`\n"
+        )
+
+    msg += f"\n_hyper-pulse.xyz — See the squeeze before it fires._"
     return msg
 
 
@@ -510,27 +618,28 @@ class SignalTracker:
         )
         self.conn.commit()
 
-    def resolve_signals(self, hl_data: HyperliquidData):
-        """Auto-resolve open signals: check if target/stop hit or TTL expired."""
+    def resolve_signals(self, hl_data: HyperliquidData) -> list[dict]:
+        """Auto-resolve open signals. Returns list of newly resolved signals."""
         open_signals = self.conn.execute(
             """SELECT id, coin, direction, entry_price, target_price,
-                      stop_price, timestamp
+                      stop_price, timestamp, score
                FROM signals WHERE resolved = 0"""
         ).fetchall()
 
         now = time.time()
+        resolved_list = []
+
+        # Get all mids once (not per signal)
+        try:
+            mids = hl_data._post({"type": "allMids"})
+        except:
+            return []
 
         for row in open_signals:
-            sid, coin, direction, entry_px, target_px, stop_px, ts = row
+            sid, coin, direction, entry_px, target_px, stop_px, ts, score = row
             age_hours = (now - ts) / 3600
 
-            # Get current price
-            try:
-                mids = hl_data._post({"type": "allMids"})
-                current_price = float(mids.get(coin, 0))
-            except:
-                continue
-
+            current_price = float(mids.get(coin, 0))
             if current_price <= 0:
                 continue
 
@@ -550,7 +659,6 @@ class SignalTracker:
                 result = "loss"
             # TTL expired
             elif age_hours >= self.config.signal_ttl_hours:
-                # Determine win/loss based on direction of price movement
                 if is_long:
                     result = "win" if current_price > entry_px else "loss"
                 else:
@@ -571,7 +679,20 @@ class SignalTracker:
                     (int(now), exit_price, result, pnl_pct, sid),
                 )
 
+                resolved_list.append({
+                    "id": sid,
+                    "coin": coin,
+                    "direction": direction,
+                    "entry_price": entry_px,
+                    "exit_price": exit_price,
+                    "pnl_pct": pnl_pct,
+                    "result": result,
+                    "duration_hours": age_hours,
+                    "score": score,
+                })
+
         self.conn.commit()
+        return resolved_list
 
     def get_track_record(self) -> dict:
         """Get overall win/loss stats."""
@@ -613,7 +734,7 @@ class SignalTracker:
         return row[0] if row and row[0] else None
 
     def get_daily_summary(self) -> dict:
-        """Get today's stats for daily summary."""
+        """Get today's stats for daily summary (enhanced)."""
         today_start = int(
             datetime.now(timezone.utc)
             .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -626,11 +747,6 @@ class SignalTracker:
 
         longs = self.conn.execute(
             "SELECT COUNT(*) FROM signals WHERE created_at >= ? AND direction = 'long'",
-            (today_start,),
-        ).fetchone()[0]
-
-        resolved = self.conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE resolved = 1 AND resolved_at >= ?",
             (today_start,),
         ).fetchone()[0]
 
@@ -653,20 +769,93 @@ class SignalTracker:
             "SELECT AVG(score) FROM signals WHERE created_at >= ?", (today_start,)
         ).fetchone()[0] or 0
 
-        track = self.get_track_record()
-        wr = (track["wins"] / track["total"] * 100) if track["total"] > 0 else 0
+        avg_pnl = self.conn.execute(
+            "SELECT AVG(pnl_pct) FROM signals WHERE resolved = 1 AND resolved_at >= ?",
+            (today_start,),
+        ).fetchone()[0] or 0
+
+        # All-time stats
+        all_time = self.get_track_record()
+        all_wr = (all_time["wins"] / all_time["total"] * 100) if all_time["total"] > 0 else 0
+
+        # Today win rate
+        today_resolved = wins + losses
+        today_wr = (wins / today_resolved * 100) if today_resolved > 0 else 0
 
         return {
             "total": total,
             "longs": longs,
             "shorts": total - longs,
-            "resolved": resolved,
             "wins": wins,
             "losses": losses,
             "expired": expired,
             "avg_score": avg_score,
-            "win_rate": wr,
+            "avg_pnl_pct": avg_pnl * 100,
+            "win_rate": today_wr,
+            "all_time": {
+                "total": all_time["total"],
+                "wins": all_time["wins"],
+                "losses": all_time["losses"],
+                "win_rate": all_wr,
+            },
         }
+
+    def get_top_signals_today(self) -> list[dict]:
+        """Get today's signals sorted by PnL for summary."""
+        today_start = int(
+            datetime.now(timezone.utc)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .timestamp()
+        )
+        rows = self.conn.execute(
+            """SELECT coin, direction, pnl_pct, result, score
+               FROM signals
+               WHERE created_at >= ? AND resolved = 1
+               ORDER BY pnl_pct DESC""",
+            (today_start,),
+        ).fetchall()
+
+        return [
+            {"coin": r[0], "direction": r[1], "pnl_pct": r[2] or 0,
+             "result": r[3], "score": r[4]}
+            for r in rows
+        ]
+
+    def get_active_signals(self, hl_data: HyperliquidData) -> list[dict]:
+        """Get unresolved signals with current PnL."""
+        rows = self.conn.execute(
+            """SELECT coin, direction, entry_price, target_price, stop_price, score
+               FROM signals WHERE resolved = 0
+               ORDER BY created_at DESC"""
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        try:
+            mids = hl_data._post({"type": "allMids"})
+        except:
+            return []
+
+        active = []
+        for coin, direction, entry_px, target_px, stop_px, score in rows:
+            current_px = float(mids.get(coin, 0))
+            if current_px <= 0:
+                continue
+            if direction == "long":
+                pnl = (current_px - entry_px) / entry_px
+            else:
+                pnl = (entry_px - current_px) / entry_px
+
+            active.append({
+                "coin": coin,
+                "direction": direction,
+                "entry_price": entry_px,
+                "current_pnl_pct": pnl * 100,
+                "score": score,
+            })
+
+        return active
 
 
 # =============================================================================
@@ -693,6 +882,10 @@ class HyperPulseBot:
         self.last_data_refresh = 0.0
         self.candle_cache: dict[str, pd.DataFrame] = {}  # coin → DataFrame
         self.token_list: list[dict] = []
+
+        # Scheduled messages state
+        self._last_daily_summary_date: str = ""
+        self._last_morning_briefing_date: str = ""
 
     def run(self):
         """Main loop."""
@@ -723,11 +916,16 @@ class HyperPulseBot:
                 # Scan for squeezes
                 self._scan_and_alert()
 
-                # Resolve old signals
+                # Resolve old signals + send resolution alerts
                 try:
-                    self.tracker.resolve_signals(self.hl)
+                    resolved = self.tracker.resolve_signals(self.hl)
+                    if resolved and self.config.send_resolution_alerts:
+                        self._send_resolution_alerts(resolved)
                 except Exception as e:
                     log.error(f"Error resolving signals: {e}")
+
+                # Check scheduled messages (daily summary, morning briefing)
+                self._check_scheduled_messages()
 
                 # Sleep
                 log.info(f"💤 Prochain scan dans {self.config.scan_interval_sec}s...")
@@ -927,6 +1125,148 @@ class HyperPulseBot:
                 log.error(f"❌ Échec envoi alerte {coin}")
 
         self.tracker.mark_alerted(sid)
+
+    # =========================================================================
+    # RESOLUTION ALERTS
+    # =========================================================================
+
+    def _send_resolution_alerts(self, resolved: list[dict]):
+        """Send alerts for each newly resolved signal."""
+        for r in resolved:
+            msg = format_resolution_alert(
+                coin=r["coin"],
+                direction=r["direction"],
+                entry_price=r["entry_price"],
+                exit_price=r["exit_price"],
+                pnl_pct=r["pnl_pct"],
+                result=r["result"],
+                duration_hours=r["duration_hours"],
+                score=r["score"],
+            )
+
+            result_emoji = "✅" if "win" in r["result"] else "❌"
+            log.info(
+                f"  {result_emoji} Résolu: {r['coin']} {r['direction']} "
+                f"→ {r['result']} ({r['pnl_pct']:+.1%})"
+            )
+
+            if self.config.dry_run:
+                print("\n" + "-" * 40)
+                print(msg.replace("*", "").replace("`", "").replace("_", ""))
+                print("-" * 40 + "\n")
+            elif self.telegram:
+                self.telegram.send_message(msg)
+
+    # =========================================================================
+    # SCHEDULED MESSAGES
+    # =========================================================================
+
+    def _check_scheduled_messages(self):
+        """Check if daily summary or morning briefing should be sent."""
+        now_utc = datetime.now(timezone.utc)
+        today_str = now_utc.strftime("%Y-%m-%d")
+
+        # Daily summary at configured hour (default 21h UTC = 23h Paris)
+        if (
+            now_utc.hour == self.config.daily_summary_hour_utc
+            and self._last_daily_summary_date != today_str
+        ):
+            self._send_daily_summary()
+            self._last_daily_summary_date = today_str
+
+        # Morning briefing at configured hour (default 8h UTC = 10h Paris)
+        if (
+            now_utc.hour == self.config.morning_briefing_hour_utc
+            and self._last_morning_briefing_date != today_str
+        ):
+            self._send_morning_briefing()
+            self._last_morning_briefing_date = today_str
+
+    def _send_daily_summary(self):
+        """Compile and send the daily summary."""
+        log.info("📊 Envoi du résumé quotidien...")
+
+        try:
+            stats = self.tracker.get_daily_summary()
+            top_signals = self.tracker.get_top_signals_today()
+            msg = format_daily_summary(stats, top_signals)
+
+            if self.config.dry_run:
+                print("\n" + "=" * 50)
+                print("📊 DAILY SUMMARY")
+                print(msg.replace("*", "").replace("`", "").replace("_", ""))
+                print("=" * 50 + "\n")
+            elif self.telegram:
+                success = self.telegram.send_message(msg)
+                if success:
+                    log.info("  ✅ Résumé quotidien envoyé")
+                else:
+                    log.error("  ❌ Échec envoi résumé quotidien")
+        except Exception as e:
+            log.error(f"Erreur résumé quotidien: {e}")
+
+    def _send_morning_briefing(self):
+        """Compile and send morning briefing with watchlist."""
+        log.info("☀️ Envoi du briefing matinal...")
+
+        try:
+            # Get building squeezes from last scan
+            funding_rates = {}
+            try:
+                funding_rates = self.hl.get_funding_rates()
+            except:
+                pass
+
+            building_signals = []
+            for coin, df in self.candle_cache.items():
+                if len(df) < 100:
+                    continue
+                try:
+                    signal = self.detector.analyze(
+                        df, coin,
+                        funding_rate=funding_rates.get(coin, 0.0),
+                    )
+                    if signal.phase == SqueezePhase.BUILDING and signal.score >= 0.4:
+                        building_signals.append({
+                            "coin": coin,
+                            "score": signal.score,
+                            "ttm_squeeze": signal.ttm_squeeze,
+                            "ttm_bars": signal.ttm_squeeze_bars,
+                            "bb_pct": signal.bb_width_percentile,
+                        })
+                except:
+                    pass
+
+            building_signals.sort(key=lambda s: s["score"], reverse=True)
+
+            # Active signals
+            active_signals = self.tracker.get_active_signals(self.hl)
+
+            # Market stats
+            avg_funding = (
+                sum(funding_rates.values()) / len(funding_rates)
+                if funding_rates else 0
+            )
+            market_stats = {
+                "total_tokens": len(self.candle_cache),
+                "avg_funding": avg_funding * 100,
+            }
+
+            msg = format_morning_briefing(building_signals, active_signals, market_stats)
+
+            if self.config.dry_run:
+                print("\n" + "=" * 50)
+                print("☀️ MORNING BRIEFING")
+                print(msg.replace("*", "").replace("`", "").replace("_", ""))
+                print("=" * 50 + "\n")
+            elif self.telegram:
+                success = self.telegram.send_message(msg)
+                if success:
+                    log.info("  ✅ Briefing matinal envoyé")
+                else:
+                    log.error("  ❌ Échec envoi briefing matinal")
+        except Exception as e:
+            log.error(f"Erreur briefing matinal: {e}")
 
 
 # =============================================================================

@@ -246,6 +246,7 @@ def compute_indicators(df: pd.DataFrame, config: SqueezeConfig) -> pd.DataFrame:
     df["ema_fast"] = close.ewm(span=config.ema_fast, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=config.ema_slow, adjust=False).mean()
     df["ema_trend"] = close.ewm(span=config.ema_trend, adjust=False).mean()
+    df["ema_200"] = close.ewm(span=200, adjust=False).mean()
     df["ema_bullish"] = df["ema_fast"] > df["ema_slow"]
     df["ema_spread"] = (df["ema_fast"] - df["ema_slow"]) / close.replace(0, np.nan)
     df["ema_trend_slope"] = df["ema_trend"].pct_change(5)
@@ -394,14 +395,16 @@ def predict_direction(
     config: Optional[SqueezeConfig] = None,
 ) -> tuple[BreakoutDirection, float]:
     """
-    Prédit la direction probable du breakout.
-    Retourne (direction, confidence 0-1).
-    
-    Méthode multi-signal :
-    - Position du prix dans les BB (haut = bullish)
-    - EMA alignment
+    Predict the probable breakout direction.
+    Returns (direction, confidence 0-1).
+
+    Multi-signal method:
+    - EMA alignment (price > EMA50 > EMA200 = strong bullish)
+    - EMA spread and slope
     - MACD histogram slope
     - RSI momentum
+    - Recent price action (candle color streaks)
+    - Breakout confirmation (reduced weight — noisy on 1h)
     """
     cfg = config or SqueezeConfig()
 
@@ -419,7 +422,18 @@ def predict_direction(
         elif value <= down_threshold:
             bear_weight += weight
 
-    # Signaux de tendance (prioritaires)
+    # EMA alignment: price > EMA50 > EMA200 = strong bullish (weight 3.0)
+    close_val = float(row.get("close", np.nan))
+    ema50_val = float(row.get("ema_trend", np.nan))
+    ema200_val = float(row.get("ema_200", np.nan))
+    if pd.notna(close_val) and pd.notna(ema50_val) and pd.notna(ema200_val):
+        total_weight += 3.0
+        if close_val > ema50_val > ema200_val:
+            bull_weight += 3.0
+        elif close_val < ema50_val < ema200_val:
+            bear_weight += 3.0
+
+    # Trend signals
     vote(float(row.get("ema_spread", 0.0) or 0.0), 0.0015, -0.0015, 2.0)
     vote(float(row.get("ema_trend_slope", 0.0) or 0.0), 0.0020, -0.0020, 1.5)
     vote(
@@ -429,19 +443,30 @@ def predict_direction(
         1.2,
     )
 
+    # Recent price action: last 5 candles direction (weight 1.5)
+    ret_3 = float(row.get("ret_3", 0.0) or 0.0)
+    ret_8 = float(row.get("ret_8", 0.0) or 0.0)
+    if pd.notna(ret_3) and pd.notna(ret_8):
+        # If both recent returns are positive = bullish momentum
+        total_weight += 1.5
+        if ret_3 > 0.005 and ret_8 > 0.01:
+            bull_weight += 1.5
+        elif ret_3 < -0.005 and ret_8 < -0.01:
+            bear_weight += 1.5
+
     # Momentum
     vote(float(row.get("macd_hist_slope", 0.0) or 0.0), 0.0, 0.0, 1.0)
     vote(float(row.get("rsi", 50.0) or 50.0), 55.0, 45.0, 0.9)
     vote(float(row.get("ret_8", 0.0) or 0.0), 0.01, -0.01, 0.9)
     vote(float(row.get("bb_position", 0.5) or 0.5), 0.56, 0.44, 0.8)
 
-    # Breakout confirmé a un poids important
+    # Breakout confirmation (reduced weight from 2.1 to 1.0 — too noisy on 1h)
     if row.get("breakout_up", False):
-        bull_weight += 2.1
-        total_weight += 2.1
+        bull_weight += 1.0
+        total_weight += 1.0
     elif row.get("breakout_down", False):
-        bear_weight += 2.1
-        total_weight += 2.1
+        bear_weight += 1.0
+        total_weight += 1.0
 
     if total_weight <= 0:
         return BreakoutDirection.UNKNOWN, 0.0
@@ -449,7 +474,8 @@ def predict_direction(
     dominance = abs(bull_weight - bear_weight) / total_weight
     confidence = max(bull_weight, bear_weight) / total_weight
 
-    if dominance < cfg.direction_dead_zone:
+    # Increased dead zone from 0.08 to 0.15
+    if dominance < 0.15:
         return BreakoutDirection.UNKNOWN, confidence * 0.5
 
     if bull_weight > bear_weight:

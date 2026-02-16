@@ -3,30 +3,32 @@
 =============================================================================
  HYPERPULSE — See the squeeze before it fires.
 =============================================================================
- Bot Telegram d'alertes squeeze pour Hyperliquid.
+ Telegram alert bot for Hyperliquid squeeze setups.
 
- Scanne toutes les paires Hyperliquid, détecte les squeezes,
- prédit la direction, ajuste avec les funding rates,
- et envoie des alertes Telegram formatées.
+ Scans all Hyperliquid perp pairs, detects squeezes,
+ predicts direction, adjusts with funding rates,
+ and sends formatted Telegram alerts.
 
  Usage:
-   # Premier lancement (collecte ~200 candles par token, ~10 min)
+   # First launch (collects ~200 candles per token, ~10 min)
    python hyperpulse_bot.py --telegram-token YOUR_BOT_TOKEN --channel-id @your_channel
 
-   # Mode dry-run (affiche dans le terminal, pas de Telegram)
+   # Dry-run mode (prints to terminal, no Telegram)
    python hyperpulse_bot.py --dry-run
 
-   # Config custom
+   # Custom config
    python hyperpulse_bot.py --telegram-token TOKEN --channel-id @chan \
-       --scan-interval 300 --min-score 0.55 --min-confidence 0.60
+       --scan-interval 300 --min-score 0.80 --min-confidence 0.85
 
- Prérequis:
+ Requirements:
    pip install requests pandas numpy python-telegram-bot --break-system-packages
 
  Structure:
-   hyperpulse_bot.py    ← Ce fichier (le bot)
-   squeeze_detector.py  ← Ton détecteur existant (inchangé)
-   hyperpulse.db        ← Base SQLite (créée automatiquement)
+   hyperpulse_bot.py      <- Main bot
+   squeeze_detector.py    <- Squeeze detection engine
+   trend_filter.py        <- BTC + token trend filter
+   structure_analysis.py  <- Market structure analysis
+   hyperpulse.db          <- SQLite database (auto-created)
 =============================================================================
 """
 
@@ -53,6 +55,8 @@ from squeeze_detector import (
     SqueezePhase,
     BreakoutDirection,
 )
+from trend_filter import compute_trend, should_block_signal
+from structure_analysis import analyze_structure, should_take_signal
 
 
 # =============================================================================
@@ -73,48 +77,49 @@ log = logging.getLogger("hyperpulse")
 
 @dataclass
 class HyperPulseConfig:
-    """Configuration du bot HyperPulse."""
+    """HyperPulse bot configuration."""
 
     # --- Telegram ---
     telegram_token: str = ""
-    channel_id: str = ""            # @channel_name ou -100xxxxx (chat ID)
-    premium_channel_id: str = ""    # Channel premium (optionnel)
+    channel_id: str = ""            # @channel_name or -100xxxxx (chat ID)
+    premium_channel_id: str = ""    # Premium channel (optional)
 
     # --- Mode ---
-    dry_run: bool = False           # Pas de Telegram, print seulement
+    dry_run: bool = False           # No Telegram, print only
 
     # --- Scan ---
-    scan_interval_sec: int = 300    # 5 minutes entre chaque scan
-    data_refresh_sec: int = 900     # 15 min entre chaque refresh complet des candles
-    warmup_candles: int = 200       # Nombre de candles pour warm-up des indicateurs
+    scan_interval_sec: int = 300    # 5 minutes between scans
+    data_refresh_sec: int = 900     # 15 min between full candle refresh
+    warmup_candles: int = 200       # Number of candles for indicator warm-up
 
-    # --- Filtres signaux ---
-    min_squeeze_score: float = 0.55
-    min_direction_confidence: float = 0.60
+    # --- Signal filters ---
+    min_squeeze_score: float = 0.80
+    min_direction_confidence: float = 0.85
     min_expected_move_pct: float = 0.02
+    min_ttm_squeeze_bars: int = 3   # Minimum TTM squeeze bars
     required_phases: list = field(
         default_factory=lambda: ["ready", "firing"]
     )
-    # Tokens: volume min/max pour filtrer
+    # Tokens: min/max volume filter
     min_volume_24h: float = 100_000
     max_volume_24h: float = 500_000_000
 
     # --- Funding rate adjustment ---
-    funding_boost_max: float = 0.15     # ±15% confidence adjustment
-    funding_strong_threshold: float = 0.0003  # 0.03%/h = signal fort
+    funding_boost_max: float = 0.15     # +/-15% confidence adjustment
+    funding_strong_threshold: float = 0.0003  # 0.03%/h = strong signal
 
     # --- Signal tracking ---
-    signal_ttl_hours: int = 24          # Résoudre les signaux après 24h
-    cooldown_per_token_min: int = 120   # Min 2h entre deux alertes pour le même token
+    signal_ttl_hours: int = 24          # Resolve signals after 24h
+    cooldown_per_token_min: int = 120   # Min 2h between alerts for same token
 
     # --- Scheduled messages ---
-    daily_summary_hour_utc: int = 21    # 21h UTC = 23h Paris
-    morning_briefing_hour_utc: int = 8  # 8h UTC = 10h Paris
-    send_resolution_alerts: bool = True # Envoyer une alerte quand un signal est résolu
+    daily_summary_hour_utc: int = 21    # 21h UTC
+    morning_briefing_hour_utc: int = 8  # 8h UTC
+    send_resolution_alerts: bool = True # Send alert when signal is resolved
 
     # --- Free tier limits ---
     free_max_alerts_per_day: int = 5
-    free_top_n_tokens: int = 15         # Top 15 par volume seulement
+    free_top_n_tokens: int = 15         # Top 15 by volume only
 
     # --- Database ---
     db_path: str = "hyperpulse.db"
@@ -128,7 +133,7 @@ class HyperPulseConfig:
 # =============================================================================
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    """Initialise la base SQLite pour HyperPulse."""
+    """Initialize the SQLite database for HyperPulse."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -299,22 +304,20 @@ def compute_funding_adjustment(
     Returns: (confidence_adjustment, is_aligned)
 
     Logic:
-    - LONG + negative funding (shorts pay longs) = ALIGNED → boost
-    - SHORT + positive funding (longs pay shorts) = ALIGNED → boost
-    - Opposite = MISALIGNED → penalty
+    - Positive funding = market is bullish = confirms LONG
+    - Negative funding = market is bearish = confirms SHORT
     """
     if direction == BreakoutDirection.UNKNOWN or funding_rate == 0:
         return 0.0, False
 
     is_long = direction == BreakoutDirection.LONG
 
-    # Alignment: we want to trade in the direction that gets paid
-    # Negative funding → shorts pay → LONG is paid → aligned with LONG
-    # Positive funding → longs pay → SHORT is paid → aligned with SHORT
+    # Positive funding = bullish sentiment = good for longs
+    # Negative funding = bearish sentiment = good for shorts
     if is_long:
-        alignment = -funding_rate  # Positive if funding is negative (good for longs)
+        alignment = funding_rate   # Positive funding = bullish = good for longs
     else:
-        alignment = funding_rate   # Positive if funding is positive (good for shorts)
+        alignment = -funding_rate  # Negative funding = bearish = good for shorts
 
     is_aligned = alignment > 0
 
@@ -340,6 +343,7 @@ def format_signal_alert(
     target_price: float,
     stop_price: float,
     track_record: dict,
+    structure_info: str = "",
 ) -> str:
     """Format a squeeze signal as a Telegram message."""
 
@@ -351,11 +355,11 @@ def format_signal_alert(
     # Funding info
     funding_pct = funding_rate * 100
     if funding_aligned:
-        funding_status = "✅ PAYÉ"
+        funding_status = "✅ Aligned"
     elif abs(funding_rate) < 0.0001:
-        funding_status = "➖ Neutre"
+        funding_status = "➖ Neutral"
     else:
-        funding_status = "⚠️ Contre"
+        funding_status = "⚠️ Against"
 
     # Target/stop distances
     if is_long:
@@ -376,11 +380,17 @@ def format_signal_alert(
         f"📊 Signal: *{dir_text}* (conf {conf_adjusted:.0%})\n"
         f"⚡ Phase: `{phase_text}` | Score: `{signal.score:.2f}`\n"
         f"💰 Funding: `{funding_pct:+.4f}%/h` {funding_status}\n"
-        f"💵 Prix: `${entry_price:.4f}`\n"
+        f"💵 Price: `${entry_price:.4f}`\n"
         f"🎯 Target: `${target_price:.4f}` (+{target_dist:.1f}%)\n"
         f"🛑 Stop: `${stop_price:.4f}` (-{stop_dist:.1f}%)\n"
+    )
+
+    if structure_info:
+        msg += f"\n📐 _{structure_info}_\n"
+
+    msg += (
         f"\n"
-        f"_Indicateurs:_\n"
+        f"_Indicators:_\n"
         f"  ├ BB width: `P{signal.bb_width_percentile:.0f}` "
         f"{'✅' if signal.bb_width_percentile < 20 else '⚠️'}\n"
         f"  ├ TTM Squeeze: "
@@ -390,7 +400,7 @@ def format_signal_alert(
         f"  ├ Volume ratio: `{signal.volume_ratio:.1f}x`\n"
         f"  └ Expected move: `{signal.expected_move_pct:.1%}`\n"
         f"\n"
-        f"📊 Track record: {wr:.0f}% win rate ({total} signaux)"
+        f"📊 Track record: {wr:.0f}% win rate ({total} signals)"
     )
 
     return msg
@@ -409,13 +419,13 @@ def format_daily_summary(stats: dict, top_signals: list = None) -> str:
     date_str = datetime.now(timezone.utc).strftime("%d/%m/%Y")
 
     msg = (
-        f"📊 *HyperPulse — Résumé du {date_str}*\n"
+        f"📊 *HyperPulse — Daily Recap {date_str}*\n"
         f"\n"
-        f"*Signaux émis:* {total}\n"
+        f"*Signals emitted:* {total}\n"
         f"  ├ Long: {stats.get('longs', 0)} | Short: {stats.get('shorts', 0)}\n"
         f"  ├ ✅ Wins: {wins}\n"
         f"  ├ ❌ Losses: {losses}\n"
-        f"  └ ⏰ Expirés: {expired}\n"
+        f"  └ ⏰ Expired: {expired}\n"
     )
 
     if wins + losses > 0:
@@ -423,13 +433,13 @@ def format_daily_summary(stats: dict, top_signals: list = None) -> str:
             f"\n"
             f"*Performance:*\n"
             f"  ├ Win rate: *{wr:.0f}%*\n"
-            f"  ├ PnL moyen: `{avg_pnl:+.2f}%`\n"
-            f"  └ Score moyen: `{stats.get('avg_score', 0):.2f}`\n"
+            f"  ├ Avg PnL: `{avg_pnl:+.2f}%`\n"
+            f"  └ Avg score: `{stats.get('avg_score', 0):.2f}`\n"
         )
 
     # Top signals of the day
     if top_signals:
-        msg += f"\n*Meilleurs signaux:*\n"
+        msg += f"\n*Top signals:*\n"
         for s in top_signals[:5]:
             emoji = "✅" if "win" in (s.get("result") or "") else "❌" if s.get("result") else "⏳"
             pnl = s.get("pnl_pct", 0)
@@ -439,7 +449,7 @@ def format_daily_summary(stats: dict, top_signals: list = None) -> str:
     all_time = stats.get("all_time", {})
     if all_time.get("total", 0) > 0:
         msg += (
-            f"\n*All-time ({all_time['total']} signaux):*\n"
+            f"\n*All-time ({all_time['total']} signals):*\n"
             f"  Win rate: *{all_time.get('win_rate', 0):.0f}%*\n"
         )
 
@@ -461,15 +471,15 @@ def format_resolution_alert(
     is_win = "win" in result
     emoji = "✅" if is_win else "❌"
     dir_emoji = "📈" if direction == "long" else "📉"
-    result_text = "TARGET ✅" if result == "win" else "STOP ❌" if result == "loss" else f"EXPIRÉ {'✅' if is_win else '❌'}"
+    result_text = "TARGET ✅" if result == "win" else "STOP ❌" if result == "loss" else f"EXPIRED {'✅' if is_win else '❌'}"
 
     msg = (
-        f"{emoji} *RÉSULTAT — {coin}/USDC*\n"
+        f"{emoji} *RESULT — {coin}/USDC*\n"
         f"\n"
         f"{dir_emoji} {direction.upper()} | Score: `{score:.2f}`\n"
         f"💵 Entry: `${entry_price:.4f}` → Exit: `${exit_price:.4f}`\n"
-        f"📊 PnL: *{pnl_pct:+.1%}*\n"
-        f"⏱ Durée: {duration_hours:.1f}h\n"
+        f"📊 PnL: *{pnl_pct*100:+.1f}%*\n"
+        f"⏱ Duration: {duration_hours:.1f}h\n"
         f"🏁 {result_text}"
     )
     return msg
@@ -487,7 +497,7 @@ def format_morning_briefing(
 
     # Active (unresolved) signals
     if active_signals:
-        msg += f"\n*📍 Positions ouvertes ({len(active_signals)}):*\n"
+        msg += f"\n*📍 Open positions ({len(active_signals)}):*\n"
         for s in active_signals[:5]:
             dir_emoji = "📈" if s["direction"] == "long" else "📉"
             pnl = s.get("current_pnl_pct", 0)
@@ -496,7 +506,7 @@ def format_morning_briefing(
 
     # Building squeezes (watchlist)
     if building_signals:
-        msg += f"\n*👀 Squeezes en formation ({len(building_signals)}):*\n"
+        msg += f"\n*👀 Building squeezes ({len(building_signals)}):*\n"
         for s in building_signals[:8]:
             ttm = "🔵" if s.get("ttm_squeeze") else "⚪"
             msg += (
@@ -505,14 +515,14 @@ def format_morning_briefing(
                 f"| TTM {s.get('ttm_bars', 0)} bars\n"
             )
     else:
-        msg += f"\n_Aucun squeeze en formation pour le moment._\n"
+        msg += f"\n_No building squeezes at the moment._\n"
 
     # Market overview
     if market_stats:
         msg += (
-            f"\n*📈 Marché:*\n"
-            f"  Tokens scannés: {market_stats.get('total_tokens', 0)}\n"
-            f"  Funding moyen: `{market_stats.get('avg_funding', 0):+.4f}%/h`\n"
+            f"\n*📈 Market:*\n"
+            f"  Tokens scanned: {market_stats.get('total_tokens', 0)}\n"
+            f"  Avg funding: `{market_stats.get('avg_funding', 0):+.4f}%/h`\n"
         )
 
     msg += f"\n_hyper-pulse.xyz — See the squeeze before it fires._"
@@ -874,7 +884,7 @@ class HyperPulseBot:
 
         if config.dry_run:
             self.telegram = None
-            log.info("🔵 Mode DRY-RUN — pas d'envoi Telegram")
+            log.info("DRY-RUN mode — no Telegram sending")
         else:
             self.telegram = TelegramSender(config.telegram_token, config.channel_id)
 
@@ -900,10 +910,10 @@ class HyperPulseBot:
         print("=" * 60)
 
         # Initial data load
-        log.info("📊 Chargement initial des données...")
+        log.info("Loading initial data...")
         self._refresh_data()
 
-        log.info(f"🚀 Bot démarré — scan toutes les {self.config.scan_interval_sec}s\n")
+        log.info(f"Bot started — scanning every {self.config.scan_interval_sec}s\n")
 
         try:
             while True:
@@ -928,13 +938,13 @@ class HyperPulseBot:
                 self._check_scheduled_messages()
 
                 # Sleep
-                log.info(f"💤 Prochain scan dans {self.config.scan_interval_sec}s...")
+                log.info(f"Next scan in {self.config.scan_interval_sec}s...")
                 time.sleep(self.config.scan_interval_sec)
 
         except KeyboardInterrupt:
-            log.info("\n⛔ Arrêt demandé.")
+            log.info("\nShutdown requested.")
             summary = self.tracker.get_daily_summary()
-            log.info(f"📊 Résumé: {summary['total']} signaux, "
+            log.info(f"Summary: {summary['total']} signals, "
                      f"{summary['wins']}W/{summary['losses']}L, "
                      f"WR={summary['win_rate']:.0f}%")
 
@@ -944,7 +954,7 @@ class HyperPulseBot:
 
     def _refresh_data(self):
         """Refresh token list and candle data."""
-        log.info("📊 Refresh des données Hyperliquid...")
+        log.info("Refreshing Hyperliquid data...")
 
         try:
             # Get token list
@@ -952,7 +962,7 @@ class HyperPulseBot:
                 min_vol=self.config.min_volume_24h,
                 max_vol=self.config.max_volume_24h,
             )
-            log.info(f"  {len(self.token_list)} tokens trouvés")
+            log.info(f"  {len(self.token_list)} tokens found")
 
             # Fetch candles for each token
             loaded = 0
@@ -976,13 +986,13 @@ class HyperPulseBot:
                 # Progress
                 if (i + 1) % 50 == 0:
                     log.info(f"  Progress: {i+1}/{len(self.token_list)} "
-                             f"({loaded} OK, {errors} erreurs)")
+                             f"({loaded} OK, {errors} errors)")
 
             self.last_data_refresh = time.time()
-            log.info(f"  ✅ {loaded} tokens chargés ({errors} erreurs)\n")
+            log.info(f"  {loaded} tokens loaded ({errors} errors)\n")
 
         except Exception as e:
-            log.error(f"Erreur refresh: {e}")
+            log.error(f"Refresh error: {e}")
             traceback.print_exc()
 
     # =========================================================================
@@ -991,13 +1001,21 @@ class HyperPulseBot:
 
     def _scan_and_alert(self):
         """Scan all tokens and send alerts for qualifying signals."""
-        log.info("🔍 Scanning squeezes...")
+        log.info("Scanning squeezes...")
 
         # Get current funding rates
         try:
             funding_rates = self.hl.get_funding_rates()
         except:
             funding_rates = {}
+
+        # Compute BTC trend for trend filter
+        btc_trend = None
+        if "BTC" in self.candle_cache:
+            try:
+                btc_trend = compute_trend(self.candle_cache["BTC"])
+            except Exception:
+                pass
 
         # Scan all cached tokens
         signals = []
@@ -1019,6 +1037,7 @@ class HyperPulseBot:
 
         # Filter actionable signals
         actionable = []
+        blocked_count = 0
         for signal, funding in signals:
             if signal.phase.value not in self.config.required_phases:
                 continue
@@ -1027,6 +1046,10 @@ class HyperPulseBot:
             if signal.score < self.config.min_squeeze_score:
                 continue
             if signal.expected_move_pct < self.config.min_expected_move_pct:
+                continue
+
+            # TTM squeeze bars filter
+            if signal.ttm_squeeze_bars < self.config.min_ttm_squeeze_bars:
                 continue
 
             # Apply funding adjustment
@@ -1038,18 +1061,56 @@ class HyperPulseBot:
             if adjusted_confidence < self.config.min_direction_confidence:
                 continue
 
-            actionable.append((signal, funding, adjusted_confidence, aligned))
+            # TREND FILTER
+            if btc_trend is not None:
+                token_trend = compute_trend(self.candle_cache.get(signal.coin))
+                blocked, reason = should_block_signal(
+                    signal.direction.value, token_trend, btc_trend
+                )
+                if blocked:
+                    blocked_count += 1
+                    log.info(f"  Blocked {signal.coin} {signal.direction.value}: {reason}")
+                    continue
+
+            # STRUCTURE FILTER
+            struct_reason = ""
+            try:
+                structure = analyze_structure(self.candle_cache[signal.coin])
+                take, struct_adj, struct_reason = should_take_signal(
+                    signal.direction.value, structure
+                )
+                if not take:
+                    blocked_count += 1
+                    log.info(f"  Blocked {signal.coin} {signal.direction.value}: {struct_reason}")
+                    continue
+                adjusted_confidence += struct_adj
+                # Build structure info string for alert
+                parts = []
+                if structure.structure_bias != "neutral":
+                    parts.append(f"BOS {structure.structure_bias}")
+                fresh_obs = [ob for ob in structure.order_blocks if ob.fresh]
+                if fresh_obs:
+                    ob = fresh_obs[0]
+                    parts.append(f"fresh OB at ${ob.zone_bottom:.4f}")
+                if structure.recent_sweep:
+                    parts.append("liquidity sweep detected")
+                struct_reason = " + ".join(parts) if parts else ""
+            except Exception:
+                pass
+
+            actionable.append((signal, funding, adjusted_confidence, aligned, struct_reason))
 
         # Log summary
         building = [s for s, _ in signals if s.phase == SqueezePhase.BUILDING]
         log.info(
-            f"  {len(signals)} squeezes détectés "
-            f"({len(building)} building, {len(actionable)} actionables)"
+            f"  {len(signals)} squeezes detected "
+            f"({len(building)} building, {len(actionable)} actionable, "
+            f"{blocked_count} blocked by trend/structure)"
         )
 
         # Process actionable signals
-        for signal, funding, adj_conf, aligned in actionable:
-            self._process_signal(signal, funding, adj_conf, aligned)
+        for signal, funding, adj_conf, aligned, struct_info in actionable:
+            self._process_signal(signal, funding, adj_conf, aligned, struct_info)
 
     def _process_signal(
         self,
@@ -1057,6 +1118,7 @@ class HyperPulseBot:
         funding_rate: float,
         adj_confidence: float,
         funding_aligned: bool,
+        structure_info: str = "",
     ):
         """Process a single actionable signal: record + alert."""
         coin = signal.coin
@@ -1109,6 +1171,7 @@ class HyperPulseBot:
         msg = format_signal_alert(
             signal, funding_rate, funding_aligned, adj_confidence,
             entry_price, target_price, stop_price, track,
+            structure_info=structure_info,
         )
 
         # Send alert
@@ -1119,10 +1182,10 @@ class HyperPulseBot:
         elif self.telegram:
             success = self.telegram.send_message(msg)
             if success:
-                log.info(f"📤 Alerte envoyée: {coin} {signal.direction.value} "
+                log.info(f"Alert sent: {coin} {signal.direction.value} "
                          f"(score={signal.score:.2f}, conf={adj_confidence:.0%})")
             else:
-                log.error(f"❌ Échec envoi alerte {coin}")
+                log.error(f"Failed to send alert for {coin}")
 
         self.tracker.mark_alerted(sid)
 
@@ -1146,8 +1209,8 @@ class HyperPulseBot:
 
             result_emoji = "✅" if "win" in r["result"] else "❌"
             log.info(
-                f"  {result_emoji} Résolu: {r['coin']} {r['direction']} "
-                f"→ {r['result']} ({r['pnl_pct']:+.1%})"
+                f"  {result_emoji} Resolved: {r['coin']} {r['direction']} "
+                f"-> {r['result']} ({r['pnl_pct']*100:+.1f}%)"
             )
 
             if self.config.dry_run:
@@ -1184,7 +1247,7 @@ class HyperPulseBot:
 
     def _send_daily_summary(self):
         """Compile and send the daily summary."""
-        log.info("📊 Envoi du résumé quotidien...")
+        log.info("Sending daily summary...")
 
         try:
             stats = self.tracker.get_daily_summary()
@@ -1199,15 +1262,15 @@ class HyperPulseBot:
             elif self.telegram:
                 success = self.telegram.send_message(msg)
                 if success:
-                    log.info("  ✅ Résumé quotidien envoyé")
+                    log.info("  Daily summary sent")
                 else:
-                    log.error("  ❌ Échec envoi résumé quotidien")
+                    log.error("  Failed to send daily summary")
         except Exception as e:
-            log.error(f"Erreur résumé quotidien: {e}")
+            log.error(f"Daily summary error: {e}")
 
     def _send_morning_briefing(self):
         """Compile and send morning briefing with watchlist."""
-        log.info("☀️ Envoi du briefing matinal...")
+        log.info("Sending morning briefing...")
 
         try:
             # Get building squeezes from last scan
@@ -1262,11 +1325,11 @@ class HyperPulseBot:
             elif self.telegram:
                 success = self.telegram.send_message(msg)
                 if success:
-                    log.info("  ✅ Briefing matinal envoyé")
+                    log.info("  Morning briefing sent")
                 else:
-                    log.error("  ❌ Échec envoi briefing matinal")
+                    log.error("  Failed to send morning briefing")
         except Exception as e:
-            log.error(f"Erreur briefing matinal: {e}")
+            log.error(f"Morning briefing error: {e}")
 
 
 # =============================================================================
@@ -1297,10 +1360,10 @@ def main():
     # Scan params
     parser.add_argument("--scan-interval", type=int, default=300,
                         help="Seconds between scans (default: 300)")
-    parser.add_argument("--min-score", type=float, default=0.55,
-                        help="Min squeeze score (default: 0.55)")
-    parser.add_argument("--min-confidence", type=float, default=0.60,
-                        help="Min direction confidence (default: 0.60)")
+    parser.add_argument("--min-score", type=float, default=0.80,
+                        help="Min squeeze score (default: 0.80)")
+    parser.add_argument("--min-confidence", type=float, default=0.85,
+                        help="Min direction confidence (default: 0.85)")
     parser.add_argument("--min-volume", type=float, default=100_000,
                         help="Min 24h volume USD (default: 100K)")
     parser.add_argument("--max-volume", type=float, default=500_000_000,
@@ -1310,16 +1373,25 @@ def main():
     parser.add_argument("--db", type=str, default="hyperpulse.db",
                         help="SQLite database path")
 
+    # Maintenance
+    parser.add_argument("--reset-signals", action="store_true",
+                        help="Archive old signals and reset history")
+
     args = parser.parse_args()
+
+    # Handle --reset-signals
+    if args.reset_signals:
+        _reset_signals(args.db)
+        sys.exit(0)
 
     # Validate
     if not args.dry_run and not args.telegram_token:
-        print("❌ Telegram token required. Use --telegram-token or --dry-run")
-        print("   Créer un bot: https://t.me/BotFather")
+        print("Telegram token required. Use --telegram-token or --dry-run")
+        print("   Create a bot: https://t.me/BotFather")
         sys.exit(1)
 
     if not args.dry_run and not args.channel_id:
-        print("❌ Channel ID required. Use --channel-id or --dry-run")
+        print("Channel ID required. Use --channel-id or --dry-run")
         sys.exit(1)
 
     config = HyperPulseConfig(
@@ -1336,6 +1408,30 @@ def main():
 
     bot = HyperPulseBot(config)
     bot.run()
+
+
+def _reset_signals(db_path: str):
+    """Archive old signals and reset the signals table."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    # Create archive table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals_archive AS
+        SELECT * FROM signals WHERE 0
+    """)
+
+    # Archive existing signals
+    count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    if count > 0:
+        conn.execute("INSERT INTO signals_archive SELECT * FROM signals")
+        conn.execute("DELETE FROM signals")
+        conn.commit()
+        print(f"Signal history reset: {count} signals archived to signals_archive")
+    else:
+        print("No signals to reset")
+
+    conn.close()
 
 
 if __name__ == "__main__":

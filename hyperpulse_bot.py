@@ -492,7 +492,7 @@ def format_morning_briefing(
             dir_emoji = "📈" if s["direction"] == "long" else "📉"
             pnl = s.get("current_pnl_pct", 0)
             pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
-            msg += f"  {dir_emoji} {s['coin']} → {pnl_emoji} `{pnl:+.1%}`\n"
+            msg += f"  {dir_emoji} {s['coin']} → {pnl_emoji} `{pnl*100:+.1f}%`\n"
 
     # Building squeezes (watchlist)
     if building_signals:
@@ -851,7 +851,7 @@ class SignalTracker:
                 "coin": coin,
                 "direction": direction,
                 "entry_price": entry_px,
-                "current_pnl_pct": pnl * 100,
+                "current_pnl_pct": pnl,
                 "score": score,
             })
 

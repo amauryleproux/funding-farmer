@@ -1011,11 +1011,12 @@ class HyperPulseBot:
 
         # Compute BTC trend for trend filter
         btc_trend = None
-        if "BTC" in self.candle_cache:
+        if "BTC" in self.candle_cache and len(self.candle_cache["BTC"]) >= 50:
             try:
                 btc_trend = compute_trend(self.candle_cache["BTC"])
-            except Exception:
-                pass
+                log.info(f"  BTC trend: {btc_trend.bias} (strength={btc_trend.strength:.0%})")
+            except Exception as e:
+                log.warning(f"  BTC trend computation failed: {e}")
 
         # Scan all cached tokens
         signals = []
@@ -1072,7 +1073,7 @@ class HyperPulseBot:
                     log.info(f"  Blocked {signal.coin} {signal.direction.value}: {reason}")
                     continue
 
-            # STRUCTURE FILTER
+            # STRUCTURE FILTER: require structural confluence
             struct_reason = ""
             try:
                 structure = analyze_structure(self.candle_cache[signal.coin])
@@ -1095,8 +1096,8 @@ class HyperPulseBot:
                 if structure.recent_sweep:
                     parts.append("liquidity sweep detected")
                 struct_reason = " + ".join(parts) if parts else ""
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"  Structure analysis failed for {signal.coin}: {e}")
 
             actionable.append((signal, funding, adjusted_confidence, aligned, struct_reason))
 

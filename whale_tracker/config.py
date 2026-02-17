@@ -43,6 +43,12 @@ class Config:
     api_timeout_seconds: int = 20
     api_retries: int = 3
 
+    # Copy-trading sizing
+    my_account_size: float = 200.0       # User's account in USD
+    max_exposure_pct: float = 0.50       # Max 50% of account per position
+    max_positions: int = 2               # Max simultaneous positions to suggest
+    min_position_usd: float = 10.0       # Hyperliquid minimum
+
     # Fallback list if leaderboard endpoint fails.
     # You can also set HL_SEED_TRADERS=0x...,0x...
     fallback_addresses: list[str] = field(default_factory=list)

@@ -40,6 +40,8 @@ class TelegramAlerter:
         self.dry_run = dry_run
         self._session: aiohttp.ClientSession | None = None
         self._pending: dict[str, PendingGroup] = {}
+        # Track active suggested positions: {(coin, direction): suggested_usd}
+        self._active_suggestions: dict[tuple[str, str], float] = {}
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -110,6 +112,72 @@ class TelegramAlerter:
         sign = "+" if value > 0 else ""
         return f"{sign}{value:.1f}%"
 
+    def _compute_sizing(
+        self, whale_account_value: float, position_value: float
+    ) -> dict[str, float | str | bool]:
+        """Compute suggested position size proportional to whale exposure."""
+        cfg = self.config
+        my_size = cfg.my_account_size
+        cap = cfg.max_exposure_pct * my_size
+        floor = cfg.min_position_usd
+
+        if whale_account_value <= 0:
+            return {"proportional": 0, "suggested": floor, "too_small": False, "capped": False, "leverage": 1.0}
+
+        whale_exposure_pct = position_value / whale_account_value
+        proportional = my_size * whale_exposure_pct
+
+        capped = proportional > cap
+        suggested = min(proportional, cap)
+        too_small = suggested < floor
+
+        if too_small:
+            suggested = 0.0
+
+        leverage = suggested / my_size if my_size > 0 and suggested > 0 else 0.0
+
+        return {
+            "proportional": proportional,
+            "suggested": suggested,
+            "too_small": too_small,
+            "capped": capped,
+            "leverage": leverage,
+            "whale_exposure_pct": whale_exposure_pct * 100,
+        }
+
+    def _sizing_block(
+        self, trader: MonitoredTrader, event: PositionEvent
+    ) -> list[str]:
+        """Build the sizing info lines for an OPEN alert."""
+        sizing = self._compute_sizing(trader.account_value, event.position_value)
+        lines: list[str] = []
+
+        at_max = len(self._active_suggestions) >= self.config.max_positions
+
+        if sizing["too_small"]:
+            lines.append(
+                f"\u26a0\ufe0f Too small to copy ({self._fmt_usd(sizing['proportional'])} < ${self.config.min_position_usd:.0f} min)"
+            )
+        else:
+            prop_str = self._fmt_usd(sizing["proportional"])
+            sugg = sizing["suggested"]
+            cap_note = f" \u2192 capped at {self._fmt_usd(sugg)} ({self.config.max_exposure_pct:.0%} max)" if sizing["capped"] else ""
+
+            lines.append(f"\U0001f4b0 YOUR SIZING (${self.config.my_account_size:.0f} account):")
+            lines.append(f"\u251c Proportional: {prop_str}{cap_note}")
+            lines.append(
+                f"\u251c Suggested: {self._fmt_usd(sugg)} {event.coin} {event.direction.upper()} @ market"
+            )
+            lines.append(f"\u2514 Leverage needed: ~{sizing['leverage']:.1f}x")
+
+            if at_max:
+                lines.append(f"\u26a0\ufe0f Max positions reached ({self.config.max_positions}) \u2014 skip or close one first")
+            else:
+                # Track this suggestion
+                self._active_suggestions[(event.coin, event.direction)] = sugg
+
+        return lines
+
     def _format_single(self, trader: MonitoredTrader, event: PositionEvent) -> str:
         rank = self.db.get_trader_rank(trader.address)
         score = f"{trader.score:.1f}"
@@ -134,17 +202,20 @@ class TelegramAlerter:
             if trader.account_value > 0:
                 pct_account = event.position_value / trader.account_value * 100
             lines.append(
-                f"Size: {event.size:.4f} {event.coin} ({self._fmt_usd(event.position_value)})"
+                f"Position: {event.size:.4f} {event.coin} ({self._fmt_usd(event.position_value)}) @ ${event.entry_price:,.4f}"
             )
-            lines.append(f"Entry: ${event.entry_price:,.4f} | Leverage: {event.leverage:.1f}x")
-            lines.append(f"Exposure: {pct_account:.1f}% of account")
+            lines.append(f"Leverage: {event.leverage:.1f}x | Exposure: {pct_account:.1f}% of account")
+            lines.append("")
+            lines.extend(self._sizing_block(trader, event))
 
         elif event.type == "CLOSE":
             pnl = event.realized_pnl if event.realized_pnl is not None else 0.0
-            outcome = "✅ WIN" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
+            outcome = "\u2705 WIN" if pnl > 0 else "\u274c LOSS" if pnl < 0 else "\u2796 FLAT"
             lines.append(f"Result: {outcome} | PnL: {self._fmt_usd(pnl)}")
             if event.entry_price > 0 or event.exit_price > 0:
                 lines.append(f"Entry: ${event.entry_price:,.4f} -> Exit: ${event.exit_price:,.4f}")
+            # Remove from active suggestions
+            self._active_suggestions.pop((event.coin, event.direction), None)
 
         elif event.type in {"INCREASE", "DECREASE"}:
             delta = event.new_size - event.old_size
@@ -162,18 +233,25 @@ class TelegramAlerter:
     def _format_grouped(self, trader: MonitoredTrader, events: list[PositionEvent]) -> str:
         rank = self.db.get_trader_rank(trader.address)
 
-        lines = [f"🐋 WHALE FLOW - {len(events)} updates", ""]
+        lines = [f"\U0001f40b WHALE FLOW - {len(events)} updates", ""]
         lines.append(f"Trader: #{rank} | Score: {trader.score:.1f}/100 | Address: {trader.address[:10]}...")
         lines.append("")
+
+        best_open: PositionEvent | None = None
+        best_open_value: float = 0.0
 
         for event in events:
             if event.type == "OPEN":
                 lines.append(
                     f"- OPEN {event.coin} {event.direction.upper()} ({self._fmt_usd(event.position_value)})"
                 )
+                if event.position_value > best_open_value:
+                    best_open = event
+                    best_open_value = event.position_value
             elif event.type == "CLOSE":
                 pnl = event.realized_pnl if event.realized_pnl is not None else 0.0
                 lines.append(f"- CLOSE {event.coin} {event.direction.upper()} ({self._fmt_usd(pnl)})")
+                self._active_suggestions.pop((event.coin, event.direction), None)
             elif event.type == "INCREASE":
                 change = ((event.new_size - event.old_size) / event.old_size * 100) if event.old_size > 0 else 0.0
                 lines.append(f"- ADD {event.coin} {event.direction.upper()} ({self._fmt_pct(change)})")
@@ -181,8 +259,30 @@ class TelegramAlerter:
                 change = ((event.old_size - event.new_size) / event.old_size * 100) if event.old_size > 0 else 0.0
                 lines.append(f"- TRIM {event.coin} {event.direction.upper()} (-{change:.1f}%)")
 
+        # Top pick sizing summary for the largest OPEN in this flow
+        if best_open is not None:
+            sizing = self._compute_sizing(trader.account_value, best_open.position_value)
+            lines.append("")
+            if sizing["too_small"]:
+                lines.append(
+                    f"\U0001f4b0 TOP PICK: {best_open.coin} {best_open.direction.upper()} \u2014 too small to copy"
+                )
+            else:
+                sugg = sizing["suggested"]
+                at_max = len(self._active_suggestions) >= self.config.max_positions
+                lines.append(
+                    f"\U0001f4b0 TOP PICK for ${self.config.my_account_size:.0f} account:"
+                )
+                lines.append(
+                    f"{best_open.coin} {best_open.direction.upper()} \u2014 {self._fmt_usd(sugg)} (largest conviction)"
+                )
+                if at_max:
+                    lines.append(f"\u26a0\ufe0f Max positions reached ({self.config.max_positions}) \u2014 skip or close one first")
+                else:
+                    self._active_suggestions[(best_open.coin, best_open.direction)] = sugg
+
         lines.append("")
-        lines.append(f"https://app.hyperliquid.xyz/explorer/address/{trader.address}")
+        lines.append(f"\U0001f517 https://app.hyperliquid.xyz/explorer/address/{trader.address}")
         return "\n".join(lines)
 
     async def _send_telegram(self, text: str) -> bool:

@@ -87,9 +87,14 @@ async def run(args: argparse.Namespace) -> None:
             )
             return
 
-        if db.count_monitored_traders() == 0:
+        monitored_count = db.count_monitored_traders()
+
+        if monitored_count == 0:
             log.info("No monitored traders in DB. Running initial scan.")
             await scanner.full_scan()
+            monitored_count = db.count_monitored_traders()
+        else:
+            log.info("Found %d monitored traders in DB. Skipping startup scan.", monitored_count)
 
         if args.scan_only:
             log.info("Scan complete. Exiting scan-only mode.")
@@ -98,12 +103,13 @@ async def run(args: argparse.Namespace) -> None:
         log.info(
             "Starting whale tracker | mode=%s monitored=%d poll=%.1fs",
             "DRY-RUN" if args.dry_run else "LIVE",
-            db.count_monitored_traders(),
+            monitored_count,
             config.poll_interval_seconds,
         )
 
+        # Refresh once per 24h (not on every restart)
         monitor_task = asyncio.create_task(monitor.poll_loop())
-        scanner_task = asyncio.create_task(scanner.periodic_refresh(config.refresh_interval_hours))
+        scanner_task = asyncio.create_task(scanner.periodic_refresh(24))
         stop_task = asyncio.create_task(stop_event.wait())
 
         done, pending = await asyncio.wait(

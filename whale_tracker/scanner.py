@@ -210,7 +210,7 @@ class TraderScanner:
                     vault_addr[:10],
                     len(followers),
                 )
-                await asyncio.sleep(self.config.api_delay_seconds)
+                await asyncio.sleep(0.3)
             except Exception as exc:
                 log.warning("Vault %s fetch failed: %s", vault_addr[:10], exc)
 
@@ -248,6 +248,7 @@ class TraderScanner:
 
     async def analyze_trader(self, address: str) -> TraderProfile:
         state = await self.client.get_clearinghouse_state(address)
+        await asyncio.sleep(0.3)
         fills = await self.client.get_user_fills(address)
 
         now_ms = int(time.time() * 1000)
@@ -368,7 +369,7 @@ class TraderScanner:
 
             if idx % 20 == 0:
                 log.info("Pre-filter progress: %d/%d checked, %d passed", idx, len(addresses), len(filtered_addresses))
-            await asyncio.sleep(self.config.api_delay_seconds)
+            await asyncio.sleep(0.3)
 
         log.info(
             "Pre-filter complete: %d/%d addresses have active positions and >= $%.0fK equity",
@@ -389,7 +390,7 @@ class TraderScanner:
 
             if idx % 10 == 0:
                 log.info("Scanner progress: %d/%d", idx, len(filtered_addresses))
-            await asyncio.sleep(self.config.api_delay_seconds)
+            await asyncio.sleep(0.3)
 
         copiable = [p for p in profiles if p.is_copiable]
         selected = sorted(copiable, key=lambda p: p.score, reverse=True)[: self.config.max_monitored_traders]
@@ -406,6 +407,10 @@ class TraderScanner:
     async def periodic_refresh(self, interval_hours: int | None = None) -> None:
         interval = interval_hours or self.config.refresh_interval_hours
         sleep_seconds = max(300, int(interval * 3600))
+
+        # Sleep first — don't scan immediately on startup
+        log.info("Scanner will refresh every %dh. Sleeping until next cycle.", interval)
+        await asyncio.sleep(sleep_seconds)
 
         while True:
             try:

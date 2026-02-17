@@ -31,8 +31,8 @@ class Config:
     min_win_rate: float = 0.50
     min_pnl_30d: float = 0
     min_trades_30d: int = 10
-    max_trades_30d: int = 500
-    min_avg_duration_hours: float = 1.0
+    max_trades_30d: int = 5000
+    min_avg_duration_hours: float = 0.1
     max_avg_duration_hours: float = 168.0
 
     # Scanner schedule

@@ -2,3 +2,5 @@ requests>=2.28.0
 python-dotenv>=1.0.0
 eth-account>=0.8.0
 hyperliquid-python-sdk>=0.5.0
+aiohttp>=3.9.0
+python-telegram-bot>=20.0

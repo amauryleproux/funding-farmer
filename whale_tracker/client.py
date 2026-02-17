@@ -83,6 +83,10 @@ class HyperliquidClient:
             return [x for x in data if isinstance(x, dict)]
         return []
 
+    async def get_vault_details(self, vault_address: str) -> dict[str, Any]:
+        data = await self.post_info({"type": "vaultDetails", "vaultAddress": vault_address})
+        return data if isinstance(data, dict) else {}
+
     async def get_user_funding(self, address: str, start_time_ms: int) -> list[dict[str, Any]]:
         data = await self.post_info(
             {"type": "userFunding", "user": address, "startTime": start_time_ms}

@@ -17,6 +17,17 @@ from whale_tracker.models import TraderProfile
 
 log = logging.getLogger("whale_tracker.scanner")
 
+# ── Vault addresses for trader discovery ──────────────────────────────
+# HLP Main vault — largest liquidity pool on Hyperliquid
+VAULT_ADDRESSES: list[str] = [
+    "0x2E645469f354BB4F5c8a05B3b30A929361cf77eC",
+]
+
+# Known mega-whale seed addresses (always included in scans)
+SEED_ADDRESSES: list[str] = [
+    "0xf3f496c9486BE5924a93D67e98298733Bb47057c",
+]
+
 
 def _to_float(value: Any, default: float = 0.0) -> float:
     if value is None:
@@ -171,22 +182,60 @@ class TraderScanner:
     async def close(self) -> None:
         await self.client.close()
 
-    async def discover_traders(self) -> list[str]:
+    async def discover_addresses_from_vaults(self) -> list[str]:
+        """Discover trader addresses from Hyperliquid vault depositors."""
         addresses: list[str] = []
 
-        try:
-            leaderboard = await self.client.get_leaderboard_addresses()
-            addresses.extend(leaderboard)
-            if leaderboard:
-                log.info("Discovered %d traders from leaderboard", len(leaderboard))
-        except Exception as exc:
-            log.warning("Leaderboard endpoint failed (%s). Falling back to seed list.", exc)
+        for vault_addr in VAULT_ADDRESSES:
+            try:
+                details = await self.client.get_vault_details(vault_addr)
+                if not details:
+                    log.warning("Vault %s returned empty details", vault_addr[:10])
+                    continue
 
+                # Extract follower/depositor addresses
+                followers = details.get("followers") or []
+                for follower in followers:
+                    user = follower.get("user", "")
+                    if user:
+                        addresses.append(user)
+
+                # Also include the vault leader
+                leader = details.get("leader", "")
+                if leader:
+                    addresses.append(leader)
+
+                log.info(
+                    "Vault %s: %d followers + leader discovered",
+                    vault_addr[:10],
+                    len(followers),
+                )
+                await asyncio.sleep(self.config.api_delay_seconds)
+            except Exception as exc:
+                log.warning("Vault %s fetch failed: %s", vault_addr[:10], exc)
+
+        return addresses
+
+    async def discover_traders(self) -> list[str]:
+        """Combine vault-based discovery, seed addresses, and config fallbacks."""
+        addresses: list[str] = []
+
+        # 1. Vault-based discovery (primary source)
+        vault_addresses = await self.discover_addresses_from_vaults()
+        addresses.extend(vault_addresses)
+        if vault_addresses:
+            log.info("Discovered %d addresses from vaults", len(vault_addresses))
+
+        # 2. Hardcoded seed addresses (known mega-whales)
+        addresses.extend(SEED_ADDRESSES)
+
+        # 3. Config fallback addresses (from env HL_SEED_TRADERS)
         if self.config.fallback_addresses:
             addresses.extend(self.config.fallback_addresses)
 
+        # Deduplicate
         deduped = []
-        seen = set()
+        seen: set[str] = set()
         for addr in addresses:
             norm = addr.lower()
             if norm in seen:
@@ -194,6 +243,7 @@ class TraderScanner:
             seen.add(norm)
             deduped.append(norm)
 
+        log.info("Total unique addresses to analyze: %d", len(deduped))
         return deduped
 
     async def analyze_trader(self, address: str) -> TraderProfile:
@@ -272,23 +322,73 @@ class TraderScanner:
             score=score,
         )
 
+    async def _has_active_positions(self, address: str) -> bool:
+        """Check if a trader has at least one open position."""
+        try:
+            state = await self.client.get_clearinghouse_state(address)
+            positions = state.get("assetPositions") or []
+            for pos in positions:
+                item = pos.get("position") or pos
+                szi = _to_float(item.get("szi"), 0.0)
+                if abs(szi) > 0:
+                    return True
+            return False
+        except Exception:
+            return False
+
     async def full_scan(self) -> list[TraderProfile]:
         addresses = await self.discover_traders()
         if not addresses:
             log.warning("No trader addresses found. Add HL_SEED_TRADERS as fallback.")
             return []
 
-        profiles: list[TraderProfile] = []
+        # Pre-filter: only analyze traders with active positions and sufficient equity
+        filtered_addresses: list[str] = []
         for idx, address in enumerate(addresses, start=1):
+            try:
+                state = await self.client.get_clearinghouse_state(address)
+                account_value = _extract_account_value(state)
+
+                # Filter: account_value >= $50K
+                if account_value < self.config.min_account_value:
+                    continue
+
+                # Filter: at least 1 active position
+                positions = state.get("assetPositions") or []
+                has_position = any(
+                    abs(_to_float((p.get("position") or p).get("szi"), 0.0)) > 0
+                    for p in positions
+                )
+                if not has_position:
+                    continue
+
+                filtered_addresses.append(address)
+            except Exception as exc:
+                log.warning("Pre-filter failed for %s: %s", address[:10], exc)
+
+            if idx % 20 == 0:
+                log.info("Pre-filter progress: %d/%d checked, %d passed", idx, len(addresses), len(filtered_addresses))
+            await asyncio.sleep(self.config.api_delay_seconds)
+
+        log.info(
+            "Pre-filter complete: %d/%d addresses have active positions and >= $%.0fK equity",
+            len(filtered_addresses),
+            len(addresses),
+            self.config.min_account_value / 1000,
+        )
+
+        # Full analysis on filtered addresses only
+        profiles: list[TraderProfile] = []
+        for idx, address in enumerate(filtered_addresses, start=1):
             try:
                 profile = await self.analyze_trader(address)
                 self.db.upsert_trader(profile)
                 profiles.append(profile)
             except Exception as exc:
-                log.warning("Failed to analyze trader %s (%s)", address, exc)
+                log.warning("Failed to analyze trader %s (%s)", address[:10], exc)
 
             if idx % 10 == 0:
-                log.info("Scanner progress: %d/%d", idx, len(addresses))
+                log.info("Scanner progress: %d/%d", idx, len(filtered_addresses))
             await asyncio.sleep(self.config.api_delay_seconds)
 
         copiable = [p for p in profiles if p.is_copiable]

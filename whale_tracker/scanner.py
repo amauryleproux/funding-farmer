@@ -20,12 +20,12 @@ log = logging.getLogger("whale_tracker.scanner")
 # ── Vault addresses for trader discovery ──────────────────────────────
 # HLP Main vault — largest liquidity pool on Hyperliquid
 VAULT_ADDRESSES: list[str] = [
-    "0x2E645469f354BB4F5c8a05B3b30A929361cf77eC",
+    "0x2E645469[a-fA-F0-9]*/0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
 ]
 
 # Known mega-whale seed addresses (always included in scans)
 SEED_ADDRESSES: list[str] = [
-    "0xf3f496c9486BE5924a93D67e98298733Bb47057c",
+    "0x31ca8395cf837de08b24da3f660e77761dfb974b",
 ]
 
 

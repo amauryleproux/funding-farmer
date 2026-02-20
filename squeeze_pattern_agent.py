@@ -15,7 +15,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+try:
+    from scipy import stats
+except ImportError:
+    stats = None
 
 try:
     import anthropic
@@ -187,7 +190,7 @@ class SqueezePatternAgent:
             loss_values = pd.to_numeric(losses_df[feature], errors="coerce").dropna()
 
             p_value = None
-            if len(win_values) > 0 and len(loss_values) > 0:
+            if stats is not None and len(win_values) > 0 and len(loss_values) > 0:
                 try:
                     p_value = stats.mannwhitneyu(win_values, loss_values, alternative="two-sided").pvalue
                 except ValueError:
@@ -643,6 +646,9 @@ class SqueezePatternAgent:
 
         if n_total < 20:
             self._print("[WARN] Dataset has fewer than 20 resolved trades. Conclusions may be noisy.")
+        if stats is None:
+            self._print("[WARN] scipy not installed: p-values and strong_signal flags are disabled.")
+            self._print("       Install with: pip install scipy")
 
         self._print("\n[ANALYSIS] Running analysis tools...")
         analyses: dict[str, Any] = {}

@@ -1,2 +1,5 @@
 squeeze_data.db
 *.db
+.cache/
+__pycache__/
+*.pyc

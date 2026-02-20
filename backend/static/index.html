@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Funding Farmer Terminal</title>
+    <link rel="stylesheet" href="/terminal-static/terminal.css?v=20260217b" />
+  </head>
+  <body>
+    <div class="bg-grid"></div>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Funding Farmer</p>
+        <h1>Backtest Terminal</h1>
+      </div>
+      <div class="topbar-right">
+        <span id="api-status" class="status-badge pending">Connecting...</span>
+        <a class="plain-link" href="/docs" target="_blank" rel="noreferrer">API Docs</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel controls">
+        <h2>Run Desk</h2>
+
+        <div class="block">
+          <h3>Single Backtest</h3>
+          <form id="single-form" class="form-grid">
+            <label>
+              Strategy
+              <select id="single-strategy" required></select>
+            </label>
+            <label>
+              Timeframe
+              <select id="single-timeframe" required></select>
+            </label>
+            <label>
+              Start
+              <input id="single-start" type="date" />
+            </label>
+            <label>
+              End
+              <input id="single-end" type="date" />
+            </label>
+            <label>
+              Max Tokens
+              <input id="single-max-tokens" type="number" min="1" max="200" value="25" />
+            </label>
+            <label>
+              Min Candles
+              <input id="single-min-candles" type="number" min="50" max="5000" value="200" />
+            </label>
+            <label class="checkbox">
+              <input id="single-async" type="checkbox" checked />
+              Run async
+            </label>
+            <div class="actions">
+              <button type="submit" class="btn-primary">Launch Single</button>
+              <button type="button" id="single-reset-params" class="btn-ghost">Reset Params</button>
+            </div>
+          </form>
+
+          <div class="subblock">
+            <div class="subhead">
+              <h4>Strategy Parameters</h4>
+              <button type="button" id="single-add-param" class="btn-mini">+ Add</button>
+            </div>
+            <div id="single-params" class="param-list"></div>
+          </div>
+        </div>
+
+        <div class="block">
+          <h3>Compare Matrix</h3>
+          <form id="compare-form" class="form-grid">
+            <label>
+              Window Mode
+              <select id="compare-window-mode">
+                <option value="both">both</option>
+                <option value="common">common</option>
+                <option value="full">full</option>
+              </select>
+            </label>
+            <label>
+              Start
+              <input id="compare-start" type="date" />
+            </label>
+            <label>
+              End
+              <input id="compare-end" type="date" />
+            </label>
+            <label>
+              Max Tokens
+              <input id="compare-max-tokens" type="number" min="1" max="200" value="25" />
+            </label>
+            <label>
+              Min Candles
+              <input id="compare-min-candles" type="number" min="50" max="5000" value="200" />
+            </label>
+            <label class="checkbox">
+              <input id="compare-async" type="checkbox" checked />
+              Run async
+            </label>
+            <div class="actions">
+              <button type="submit" class="btn-primary">Launch Compare</button>
+            </div>
+          </form>
+
+          <div class="subblock">
+            <h4>Strategies</h4>
+            <div id="compare-strategies" class="chip-list"></div>
+          </div>
+
+          <div class="subblock">
+            <h4>Timeframes</h4>
+            <div id="compare-timeframes" class="chip-list"></div>
+          </div>
+
+          <div class="subblock">
+            <h4>Shared Overrides (JSON)</h4>
+            <textarea id="compare-overrides" rows="4" placeholder='{"max_trades_per_day": 4}'></textarea>
+          </div>
+
+          <div class="subblock ai-box">
+            <div class="subhead">
+              <h4>IA Backtest (Auto Search)</h4>
+            </div>
+            <div class="form-grid">
+              <label>
+                Max Runs
+                <input id="ai-max-runs" type="number" min="10" max="2000" value="120" />
+              </label>
+              <label>
+                Top Picks
+                <input id="ai-top-n" type="number" min="1" max="20" value="5" />
+              </label>
+              <label>
+                Min Trades
+                <input id="ai-min-trades" type="number" min="0" max="1000" value="5" />
+              </label>
+              <label>
+                Max Drawdown %
+                <input id="ai-max-dd" type="number" min="1" max="100" step="0.1" value="25" />
+              </label>
+              <label>
+                Objective
+                <select id="ai-objective">
+                  <option value="balanced">balanced</option>
+                  <option value="return_only">return_only</option>
+                  <option value="low_drawdown">low_drawdown</option>
+                  <option value="consistency">consistency</option>
+                </select>
+              </label>
+              <label>
+                Seed
+                <input id="ai-seed" type="number" value="42" />
+              </label>
+              <label class="checkbox">
+                <input id="ai-force-refresh" type="checkbox" />
+                Force refresh (ignore cache)
+              </label>
+              <div class="actions">
+                <button type="button" id="launch-ai" class="btn-ai">IA Backtest</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel output">
+        <h2>Terminal Feed</h2>
+        <div class="feed-actions">
+          <button type="button" id="refresh-jobs" class="btn-ghost">Refresh Jobs</button>
+          <button type="button" id="ai-apply-run" class="btn-ai" disabled>Apply + Run Best AI</button>
+          <span id="active-job" class="muted">No active job</span>
+        </div>
+
+        <div id="summary-cards" class="kpi-grid"></div>
+
+        <div class="result-block">
+          <h3>Leaderboard / Matrix</h3>
+          <div class="table-wrap">
+            <table id="leaderboard-table">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="result-block">
+          <h3>Equity Curve</h3>
+          <div id="equity-chart" class="chart"></div>
+        </div>
+
+        <div class="result-block">
+          <h3>Blotter</h3>
+          <div class="table-wrap">
+            <table id="blotter-table">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="result-block">
+          <h3>Jobs</h3>
+          <div class="table-wrap">
+            <table id="jobs-table">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <template id="param-row-template">
+      <div class="param-row">
+        <input class="param-key" type="text" placeholder="param_name" />
+        <input class="param-value" type="text" placeholder="value" />
+        <button type="button" class="btn-mini danger">x</button>
+      </div>
+    </template>
+
+    <script src="/terminal-static/terminal.js?v=20260217b"></script>
+  </body>
+</html>

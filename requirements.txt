@@ -4,3 +4,6 @@ eth-account>=0.8.0
 hyperliquid-python-sdk>=0.5.0
 aiohttp>=3.9.0
 python-telegram-bot>=20.0
+pandas>=2.0.0
+fastapi>=0.110.0
+uvicorn>=0.27.0

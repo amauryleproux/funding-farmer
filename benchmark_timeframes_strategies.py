@@ -234,6 +234,26 @@ def strategy_presets() -> list[tuple[str, dict]]:
                 "enable_pattern_filter": False,
             },
         ),
+        (
+            "macd_trend_confirmed",
+            {
+                "entry_mode": "macd",
+                "min_entry_score": 0.45,
+                "min_direction_confidence": 0.50,
+                "min_volume_ratio": 0.20,
+                "min_expected_move_pct": 0.015,
+                "macd_min_hist_pct": 0.0002,
+                "macd_require_zero_line": True,
+                "macd_require_trend": True,
+                "macd_min_trend_slope": 0.0004,
+                "stop_atr": 1.6,
+                "target_atr": 2.5,
+                "trailing_stop_pct": 0.018,
+                "trailing_activation_pct": 0.009,
+                "max_trades_per_day": 5,
+                "enable_pattern_filter": False,
+            },
+        ),
     ]
 
 

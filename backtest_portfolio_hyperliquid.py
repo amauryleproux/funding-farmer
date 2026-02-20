@@ -308,6 +308,10 @@ def apply_runtime_defaults(args: argparse.Namespace) -> None:
         "breakout_require_trend": False,
         "ema_cross_require_trend": False,
         "ema_cross_min_trend_slope": 0.0005,
+        "macd_min_hist_pct": 0.0002,
+        "macd_require_zero_line": False,
+        "macd_require_trend": False,
+        "macd_min_trend_slope": 0.0004,
         "rsi_revert_long_rsi": 35.0,
         "rsi_revert_short_rsi": 65.0,
         "rsi_revert_long_bb_pos_max": 0.20,
@@ -830,6 +834,61 @@ def run_portfolio_backtest(
                         continue
                     filter_stats["confidence_ok"] += 1
 
+                elif args.entry_mode == "macd":
+                    if i <= 0:
+                        continue
+                    prev_row = state["df"].iloc[i - 1]
+                    prev_macd = float(prev_row.get("macd", 0.0) or 0.0)
+                    prev_signal = float(prev_row.get("macd_signal", 0.0) or 0.0)
+                    curr_macd = float(row.get("macd", 0.0) or 0.0)
+                    curr_signal = float(row.get("macd_signal", 0.0) or 0.0)
+                    cross_up = prev_macd <= prev_signal and curr_macd > curr_signal
+                    cross_down = prev_macd >= prev_signal and curr_macd < curr_signal
+                    if not cross_up and not cross_down:
+                        continue
+                    direction = BreakoutDirection.LONG if cross_up else BreakoutDirection.SHORT
+                    filter_stats["phase_ok"] += 1
+                    filter_stats["direction_ok"] += 1
+
+                    if vol_ratio < args.min_volume_ratio:
+                        continue
+                    filter_stats["volume_ok"] += 1
+                    if expected_move < args.min_expected_move_pct:
+                        continue
+                    filter_stats["move_ok"] += 1
+
+                    close_px = max(1e-9, float(row.get("close", 0.0) or 0.0))
+                    hist = float(row.get("macd_hist", 0.0) or 0.0)
+                    hist_slope = float(row.get("macd_hist_slope", 0.0) or 0.0)
+                    hist_pct = abs(hist) / close_px
+                    slope_pct = abs(hist_slope) / close_px
+
+                    if hist_pct < args.macd_min_hist_pct:
+                        continue
+                    if args.macd_require_zero_line:
+                        if direction == BreakoutDirection.LONG and curr_macd <= 0:
+                            continue
+                        if direction == BreakoutDirection.SHORT and curr_macd >= 0:
+                            continue
+
+                    trend_slope = float(row.get("ema_trend_slope", 0.0) or 0.0)
+                    if args.macd_require_trend:
+                        if direction == BreakoutDirection.LONG and trend_slope < args.macd_min_trend_slope:
+                            continue
+                        if direction == BreakoutDirection.SHORT and trend_slope > -args.macd_min_trend_slope:
+                            continue
+
+                    confidence = float(
+                        min(0.99, 0.50 + min(0.30, hist_pct * 5000.0) + min(0.15, slope_pct * 7000.0))
+                    )
+                    score = float(min(1.0, 0.45 + min(0.35, hist_pct * 7000.0) + min(0.20, slope_pct * 9000.0)))
+                    if score < args.min_entry_score:
+                        continue
+                    filter_stats["score_ok"] += 1
+                    if confidence < args.min_direction_confidence:
+                        continue
+                    filter_stats["confidence_ok"] += 1
+
                 elif args.entry_mode == "rsi_reversion":
                     rsi = float(row.get("rsi", 50.0) or 50.0)
                     bb_pos = float(row.get("bb_position", 0.5) or 0.5)
@@ -886,6 +945,8 @@ def run_portfolio_backtest(
                 elif args.entry_mode == "breakout" and (not args.breakout_require_trend):
                     trend_ok = True
                 elif args.entry_mode == "ema_cross" and (not args.ema_cross_require_trend):
+                    trend_ok = True
+                elif args.entry_mode == "macd" and (not args.macd_require_trend):
                     trend_ok = True
                 else:
                     trend_ok = (
@@ -1304,12 +1365,21 @@ def run() -> int:
     parser.add_argument("--min-firing-confidence", type=float, default=0.55)
     parser.add_argument("--min-volume-ratio", type=float, default=0.30)
     parser.add_argument("--min-expected-move-pct", type=float, default=0.02)
-    parser.add_argument("--entry-mode", type=str, choices=["squeeze", "breakout", "ema_cross", "rsi_reversion"], default="squeeze")
+    parser.add_argument(
+        "--entry-mode",
+        type=str,
+        choices=["squeeze", "breakout", "ema_cross", "macd", "rsi_reversion"],
+        default="squeeze",
+    )
     parser.add_argument("--min-entry-score", type=float, default=0.45)
     parser.add_argument("--breakout-min-vol-ratio", type=float, default=1.2)
     parser.add_argument("--breakout-require-trend", action="store_true")
     parser.add_argument("--ema-cross-require-trend", action="store_true")
     parser.add_argument("--ema-cross-min-trend-slope", type=float, default=0.0005)
+    parser.add_argument("--macd-min-hist-pct", type=float, default=0.0002)
+    parser.add_argument("--macd-require-zero-line", action="store_true")
+    parser.add_argument("--macd-require-trend", action="store_true")
+    parser.add_argument("--macd-min-trend-slope", type=float, default=0.0004)
     parser.add_argument("--rsi-revert-long-rsi", type=float, default=35.0)
     parser.add_argument("--rsi-revert-short-rsi", type=float, default=65.0)
     parser.add_argument("--rsi-revert-long-bb-pos-max", type=float, default=0.20)

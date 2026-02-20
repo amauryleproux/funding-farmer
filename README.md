@@ -221,6 +221,89 @@ python3 benchmark_timeframes_strategies.py \
   --export strategy_timeframe_benchmark.csv
 ```
 
+Le benchmark inclut maintenant **10 stratégies** (dont une nouvelle stratégie `macd_trend_confirmed`)
+sur `15m`, `30m` et `1h`.
+
+## Backend API (Bloomberg Terminal Lookalike)
+
+Backend FastAPI pour lancer les backtests en mode job (async), interroger les résultats,
+et obtenir des vues terminal type `summary`, `blotter`, `equity`, `leaderboard`.
+
+```bash
+python3 run_backend.py
+```
+
+Dashboard web (UI) :
+
+- `http://localhost:8000/`
+- `http://localhost:8000/terminal`
+- Bouton `IA Backtest` pour exploration automatique + bouton `Apply + Run Best AI` pour relancer la meilleure config en single détaillé
+
+Status API:
+
+- `GET /api/v1/status`
+
+Endpoints principaux:
+
+- `GET /api/v1/strategies` : catalogue des 10 stratégies + paramètres par défaut
+- `GET /api/v1/timeframes` : disponibilité des timeframes (`15m`, `30m`, `1h`)
+- `POST /api/v1/backtests` : lancer un backtest single stratégie/timeframe
+- `POST /api/v1/backtests/compare` : lancer une matrice stratégie x timeframe
+- `POST /api/v1/backtests/ai-run` : lancer une recherche IA des meilleures configs
+- `GET /api/v1/backtests/{job_id}` : statut + résumé du job
+- `GET /api/v1/backtests/{job_id}/blotter` : trade blotter paginé
+- `GET /api/v1/backtests/{job_id}/equity` : equity curve paginée
+- `GET /api/v1/backtests/{job_id}/leaderboard` : classement (jobs compare)
+- `GET /api/v1/backtests/{job_id}/ai-top` : top picks (jobs IA)
+
+Exemple de lancement (sync):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/backtests \
+  -H "Content-Type: application/json" \
+  -d '{
+    "run_async": false,
+    "strategy_id": "macd_trend_confirmed",
+    "timeframe": "1h",
+    "start": "2025-01-01",
+    "end": "2025-12-31",
+    "overrides": {
+      "max_trades_per_day": 4,
+      "stop_atr": 1.8
+    }
+  }'
+```
+
+Exemple IA Backtest (top 5):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/backtests/ai-run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "run_async": true,
+    "strategy_ids": ["baseline","macd_trend_confirmed","ema_cross_trend"],
+    "timeframes": ["15m","30m","1h"],
+    "start": "2026-01-01",
+    "end": "2026-02-10",
+    "max_runs": 120,
+    "top_n": 5,
+    "objective": "balanced",
+    "min_trades": 5,
+    "max_drawdown_pct": 25
+  }'
+```
+
+Les runs IA identiques sont maintenant caches automatiquement dans `.cache/ai_backtests`
+(meme payload + meme etat de DB), pour eviter de recalculer pendant des minutes.
+
+Pour forcer un nouveau run sans cache:
+
+```json
+{
+  "force_refresh": true
+}
+```
+
 ## Presets Prod Par Timeframe
 
 Lance les presets recommandés sur toute la plage disponible de chaque timeframe:

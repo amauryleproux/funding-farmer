@@ -100,6 +100,11 @@ class HyperPulseConfig:
     required_phases: list = field(
         default_factory=lambda: ["ready", "firing"]
     )
+    blocked_hours_utc: list[int] = field(
+        default_factory=lambda: [12, 13, 17, 18, 19, 20]
+    )
+    short_confidence_penalty: float = 0.15  # Extra confidence required for SHORT
+    require_funding_alignment: bool = False
     # Tokens: min/max volume filter
     min_volume_24h: float = 100_000
     max_volume_24h: float = 500_000_000
@@ -905,6 +910,9 @@ class HyperPulseBot:
         print(f"  Scan interval: {self.config.scan_interval_sec}s")
         print(f"  Min score: {self.config.min_squeeze_score}")
         print(f"  Min confidence: {self.config.min_direction_confidence}")
+        print(f"  Blocked UTC hours: {self.config.blocked_hours_utc}")
+        print(f"  Short penalty: +{self.config.short_confidence_penalty:.2f}")
+        print(f"  Require funding alignment: {self.config.require_funding_alignment}")
         if not self.config.dry_run:
             print(f"  Channel: {self.config.channel_id}")
         print("=" * 60)
@@ -999,9 +1007,20 @@ class HyperPulseBot:
     # SQUEEZE SCANNING
     # =========================================================================
 
+    def _is_valid_signal_time(self) -> bool:
+        """Return False when current UTC hour is in a dead slot."""
+        current_hour_utc = datetime.now(timezone.utc).hour
+        if current_hour_utc in self.config.blocked_hours_utc:
+            log.info(f"Signal bloque - creneau horaire mort ({current_hour_utc}h UTC)")
+            return False
+        return True
+
     def _scan_and_alert(self):
         """Scan all tokens and send alerts for qualifying signals."""
         log.info("Scanning squeezes...")
+        if not self._is_valid_signal_time():
+            log.info("Scan ignore - plage horaire bloquee")
+            return
 
         # Get current funding rates
         try:
@@ -1053,13 +1072,37 @@ class HyperPulseBot:
             if signal.ttm_squeeze_bars < self.config.min_ttm_squeeze_bars:
                 continue
 
-            # Apply funding adjustment
-            conf_adj, aligned = compute_funding_adjustment(
+            # Keep funding alignment info for logging/tracking.
+            # Funding-based confidence boost/malus is disabled.
+            _, aligned = compute_funding_adjustment(
                 signal.direction, funding, self.config
             )
-            adjusted_confidence = signal.direction_confidence + conf_adj
+            adjusted_confidence = signal.direction_confidence
 
             if adjusted_confidence < self.config.min_direction_confidence:
+                blocked_count += 1
+                log.info(
+                    f"Signal {signal.coin} {signal.direction.value.upper()} rejete - "
+                    f"confidence {adjusted_confidence:.2f} < seuil min {self.config.min_direction_confidence:.2f}"
+                )
+                continue
+
+            effective_min_confidence = self.config.min_direction_confidence
+            if signal.direction == BreakoutDirection.SHORT:
+                effective_min_confidence += self.config.short_confidence_penalty
+            if adjusted_confidence < effective_min_confidence:
+                blocked_count += 1
+                log.info(
+                    f"Signal {signal.coin} SHORT rejete - confidence {adjusted_confidence:.2f} "
+                    f"< seuil SHORT requis {effective_min_confidence:.2f}"
+                )
+                continue
+
+            if self.config.require_funding_alignment and not aligned:
+                blocked_count += 1
+                log.info(
+                    f"Signal {signal.coin} {signal.direction.value.upper()} rejete - funding non aligne"
+                )
                 continue
 
             # TREND FILTER
@@ -1106,11 +1149,15 @@ class HyperPulseBot:
         log.info(
             f"  {len(signals)} squeezes detected "
             f"({len(building)} building, {len(actionable)} actionable, "
-            f"{blocked_count} blocked by trend/structure)"
+            f"{blocked_count} blocked by filters)"
         )
 
         # Process actionable signals
         for signal, funding, adj_conf, aligned, struct_info in actionable:
+            log.info(
+                f"Signal {signal.coin} {signal.direction.value.upper()} accepte - "
+                f"tous filtres passes (score={signal.score:.2f}, conf={adj_conf:.2f})"
+            )
             self._process_signal(signal, funding, adj_conf, aligned, struct_info)
 
     def _process_signal(
@@ -1357,6 +1404,11 @@ def main():
     # Mode
     parser.add_argument("--dry-run", action="store_true",
                         help="Print alerts to terminal, no Telegram")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logs (DEBUG level)",
+    )
 
     # Scan params
     parser.add_argument("--scan-interval", type=int, default=300,
@@ -1365,6 +1417,24 @@ def main():
                         help="Min squeeze score (default: 0.80)")
     parser.add_argument("--min-confidence", type=float, default=0.85,
                         help="Min direction confidence (default: 0.85)")
+    parser.add_argument(
+        "--blocked-hours",
+        type=str,
+        default="12,13,17,18,19,20",
+        help="Blocked UTC hours, comma-separated (default: 12,13,17,18,19,20)",
+    )
+    parser.add_argument(
+        "--short-penalty",
+        type=float,
+        default=0.15,
+        help="Confidence penalty applied to SHORT signals (default: 0.15)",
+    )
+    parser.add_argument(
+        "--require-funding-alignment",
+        action="store_true",
+        default=False,
+        help="Require funding alignment (disabled by default)",
+    )
     parser.add_argument("--min-volume", type=float, default=100_000,
                         help="Min 24h volume USD (default: 100K)")
     parser.add_argument("--max-volume", type=float, default=500_000_000,
@@ -1379,6 +1449,16 @@ def main():
                         help="Archive old signals and reset history")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        log.setLevel(logging.DEBUG)
+
+    try:
+        blocked_hours_utc = _parse_blocked_hours(args.blocked_hours)
+    except ValueError as e:
+        print(f"Invalid --blocked-hours value: {e}")
+        sys.exit(1)
 
     # Handle --reset-signals
     if args.reset_signals:
@@ -1402,6 +1482,9 @@ def main():
         scan_interval_sec=args.scan_interval,
         min_squeeze_score=args.min_score,
         min_direction_confidence=args.min_confidence,
+        blocked_hours_utc=blocked_hours_utc,
+        short_confidence_penalty=args.short_penalty,
+        require_funding_alignment=args.require_funding_alignment,
         min_volume_24h=args.min_volume,
         max_volume_24h=args.max_volume,
         db_path=args.db,
@@ -1433,6 +1516,23 @@ def _reset_signals(db_path: str):
         print("No signals to reset")
 
     conn.close()
+
+
+def _parse_blocked_hours(raw: str) -> list[int]:
+    """Parse --blocked-hours like '12,13,17' into sorted unique ints."""
+    if not raw or not raw.strip():
+        return []
+
+    hours: set[int] = set()
+    for chunk in raw.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        value = int(token)
+        if value < 0 or value > 23:
+            raise ValueError(f"hour out of range [0,23]: {value}")
+        hours.add(value)
+    return sorted(hours)
 
 
 if __name__ == "__main__":
